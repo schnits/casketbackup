@@ -1,105 +1,238 @@
 import java.io.*;
-import java.nio.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.*;
-import java.security.*;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
-import java.nio.channels.FileChannel;
-
+import javax.crypto.Cipher;
+import javax.crypto.Mac;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
 
 /**
  * ColdStore — incremental backup with streaming FastCDC + per-file Reed–Solomon parity,
- * designed to span multiple OFFLINE drives without a central hub. Each drive holds a
- * fully self-contained "repo root" (repo.properties, chunks, parity, manifests).
+ * cross-drive dedupe with a portable, location-aware global index, optional AES-256-GCM
+ * encryption for chunks & parity, optional MANIFEST encryption, offline drive-by-drive
+ * restore and restore planning.
  *
- * Core guarantees:
- *  - Memory-safe: streaming chunker; bounded buffers (~maxChunk + small parity stripe).
- *  - Incremental: content-addressed chunks (SHA-256) dedupe within the current drive.
- *  - Parity: per-file stripes (K data, R parity). Stripe location is deterministic:
- *      parity/<SNAP>/<fileIdHash>/stripe-XXXX/{p_0..p_{R-1}} + sidecar.json
- *    so we never need a huge global "chunk->stripe" index.
- *  - Drive spanning: "Restore" searches across whatever repo roots you attach. If a chunk
- *    or stripe is missing, it asks you to attach another drive path and continues.
- *
- * Java 17+; no external deps.
+ * Java 11+ (uses InputStream.transferTo). No external libraries.
  */
 public class ColdStore {
 
-    // ======== CLI ========
+    // ================= Logger =================
+
+    enum Lvl { OFF, INFO, DEBUG, TRACE }
+    static final class LOG {
+        static volatile Lvl LEVEL = Lvl.INFO;
+        static void set(String s){ try { LEVEL = Lvl.valueOf(s.toUpperCase(Locale.ROOT)); } catch (Exception e) { LEVEL = Lvl.INFO; } }
+        static void info (String fmt, Object... a){ if (LEVEL.ordinal()>=Lvl.INFO.ordinal())  out("INFO ", fmt, a); }
+        static void debug(String fmt, Object... a){ if (LEVEL.ordinal()>=Lvl.DEBUG.ordinal()) out("DEBUG", fmt, a); }
+        static void trace(String fmt, Object... a){ if (LEVEL.ordinal()>=Lvl.TRACE.ordinal()) out("TRACE", fmt, a); }
+        private static void out(String lvl, String fmt, Object... a){
+            String ts = DateTimeFormatter.ISO_LOCAL_DATE_TIME.format(LocalDateTime.now());
+            System.out.printf("%s [%s] %s%n", ts, lvl, String.format(Locale.ROOT, fmt, a));
+        }
+    }
+    static String hb(long n){ String[] u={"B","KiB","MiB","GiB","TiB","PiB"}; double v=n; int i=0; while(v>=1024 && i<u.length-1){ v/=1024; i++; } return String.format(Locale.ROOT,"%.2f %s", v, u[i]); }
+
+    // ================= Main / CLI =================
 
     public static void main(String[] args) throws Exception {
         Map<String,String> a = parseArgs(args);
         String cmd = a.getOrDefault("_cmd", "");
+        LOG.set(a.getOrDefault("--log", "info"));
         if (cmd.isEmpty()) { usage(); return; }
 
         switch (cmd) {
             case "init" -> {
                 Path repo = mustPath(a, "--repo");
-                RepoVolume v = RepoVolume.openOrInit(repo,
+                boolean encrypt = Boolean.parseBoolean(a.getOrDefault("--encrypt","false"));
+                boolean obfParity = Boolean.parseBoolean(a.getOrDefault("--obfuscate-parity", encrypt ? "true" : "false"));
+                boolean encManifest = Boolean.parseBoolean(a.getOrDefault("--encrypt-manifest","false"));
+
+                RepoVolume v = RepoVolume.openOrInit(
+                        repo,
                         a.getOrDefault("--name", repo.getFileName().toString()),
                         pInt(a.getOrDefault("--rs-k","8")),
                         pInt(a.getOrDefault("--rs-r","2")),
                         pInt(a.getOrDefault("--min-chunk","262144")),
                         pInt(a.getOrDefault("--avg-chunk","1048576")),
                         pInt(a.getOrDefault("--max-chunk","4194304")),
-                        Boolean.parseBoolean(a.getOrDefault("--compress","false"))
+                        Boolean.parseBoolean(a.getOrDefault("--compress","false")),
+                        encrypt, obfParity, encManifest
                 );
-                System.out.println("Initialized repo drive: " + v.props.repoName + " at " + repo);
+
+                Crypto.Ctx crypto = Crypto.ctxForRepo(v, passFrom(a)); // may create key.enc if crypto features enabled
+                LOG.info("Initialized repo: %s (repo.id=%s drive.id=%s) at %s", v.props.repoName, v.props.repoId, v.props.driveId, repo);
                 v.showInfo();
             }
             case "info" -> {
                 Path repo = mustPath(a, "--repo");
-                RepoVolume v = RepoVolume.openOrInit(repo, null, 8,2,262144,1048576,4194304,false);
+                RepoVolume v = RepoVolume.openOrInit(repo, null,8,2,262144,1048576,4194304,false,false,false,false);
                 v.showInfo();
             }
             case "list" -> {
                 Path repo = mustPath(a, "--repo");
-                RepoVolume v = RepoVolume.openOrInit(repo, null, 8,2,262144,1048576,4194304,false);
+                RepoVolume v = RepoVolume.openOrInit(repo, null,8,2,262144,1048576,4194304,false,false,false,false);
                 v.listSnapshots();
             }
             case "backup" -> {
                 Path repo = mustPath(a, "--repo");
                 Path source = mustPath(a, "--source");
-                long targetBytes = pLong(a.getOrDefault("--target-bytes", String.valueOf(Long.MAX_VALUE)));
-                RepoVolume v = RepoVolume.openOrInit(repo, null, 8,2,262144,1048576,4194304,false);
+                long targetBytes = a.containsKey("--target-bytes") ? pLong(a.get("--target-bytes")) : Long.MAX_VALUE;
+                double targetFill = a.containsKey("--target-fill") ? pDouble(a.get("--target-fill")) : -1.0;
+
+                RepoVolume v = RepoVolume.openOrInit(repo, null,8,2,262144,1048576,4194304,false,false,false,false);
+                Crypto.Ctx crypto = Crypto.ctxForRepo(v, passFrom(a));
+
+                GlobalIndex gidx = null;
+                if (a.containsKey("--global-index")) {
+                    gidx = GlobalIndex.open(Paths.get(a.get("--global-index")), v.props.repoId, v.props.repoName, v.props.driveId, v.root.toString());
+                    LOG.info("Using global index at %s (repoId=%s, driveOrdinal=%d)", Paths.get(a.get("--global-index")).toAbsolutePath(), v.props.repoId, gidx.currentDriveOrdinal());
+                }
+
                 String snapName = "SNAP_" + DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH-mm-ss'Z'")
                         .withZone(ZoneOffset.UTC).format(Instant.now());
-                Backup.runBackup(v, source, snapName, targetBytes);
+
+                LOG.info("Starting backup: snapshot=%s, source=%s, RS(k=%d,r=%d), CDC(min=%s,avg=%s,max=%s), compress=%s, encrypt=%s, encManifest=%s",
+                        snapName, source, v.props.rsK, v.props.rsR,
+                        hb(v.props.cMin), hb(v.props.cAvg), hb(v.props.cMax), v.props.compress, v.props.encrypt, v.props.encryptManifest);
+
+                Backup.runBackup(v, source, snapName, targetBytes, targetFill, gidx, crypto);
             }
             case "restore" -> {
-                // You can restore one snapshot (preferred), OR restore union of latest from each attached volume.
                 Path firstRepo = mustPath(a, "--repo");
-                String snapshot = a.get("--snapshot"); // optional if --union-latest
+                String snapshot = a.get("--snapshot");
                 boolean unionLatest = Boolean.parseBoolean(a.getOrDefault("--union-latest","false"));
                 Path dest = mustPath(a, "--dest");
+                String onlyFile = a.get("--only-file");
+                String onlyPrefix = a.get("--only-prefix");
 
-                // Start with one attached repo; we can add more interactively.
+                RepoVolume first = RepoVolume.openOrInit(firstRepo, null,8,2,262144,1048576,4194304,false,false,false,false);
+                Crypto.Ctx crypto = Crypto.ctxForRepo(first, passFrom(a));
+
                 List<RepoVolume> attached = new ArrayList<>();
-                attached.add(RepoVolume.openOrInit(firstRepo, null, 8,2,262144,1048576,4194304,false));
-                Restore.run(attached, snapshot, unionLatest, dest);
+                attached.add(first);
+                LOG.info("Starting restore (dest=%s, snapshot=%s, unionLatest=%s, onlyFile=%s, onlyPrefix=%s)",
+                        dest, snapshot, unionLatest, onlyFile, onlyPrefix);
+                Restore.run(attached, snapshot, unionLatest, dest, crypto, onlyFile, onlyPrefix);
+            }
+            case "restore-plan" -> {
+                Path idxPath = mustPath(a, "--global-index");
+                Path repo = a.containsKey("--repo") ? mustPath(a, "--repo") : null;
+                String snapshot = a.get("--snapshot");
+                Path manifest = a.containsKey("--manifest") ? mustPath(a, "--manifest") : null;
+                String onlyFile = a.get("--only-file");
+                String onlyPrefix = a.get("--only-prefix");
+                Integer maxDrives = a.containsKey("--max-drives") ? Integer.valueOf(a.get("--max-drives")) : null;
+                String pass = passFrom(a);
+
+                Planner.planWithGlobalIndex(idxPath, repo, snapshot, manifest, onlyFile, onlyPrefix, pass, maxDrives);
+            }
+            case "index-compact" -> {
+                Path idxPath = mustPath(a, "--global-index");
+                GlobalIndex gidx = GlobalIndex.open(idxPath, null, null, null, null);
+                LOG.info("Compacting global index at %s ...", idxPath.toAbsolutePath());
+                gidx.compact();
+                LOG.info("Index compaction complete.");
+            }
+            case "inventory" -> {
+                String mode = a.getOrDefault("--mode","scan");
+                switch (mode) {
+                    case "scan" -> {
+                        Path repo = mustPath(a, "--repo");
+                        Path invDir = mustPath(a, "--inventory");
+                        RepoVolume v = RepoVolume.openOrInit(repo, null,8,2,262144,1048576,4194304,false,false,false,false);
+                        Inventory.scanDrive(v, invDir, pInt(a.getOrDefault("--bpe","10")));
+                    }
+                    case "list" -> {
+                        Path invDir = mustPath(a, "--inventory");
+                        Inventory.list(invDir, a.get("--repo"));
+                    }
+                    case "locate" -> {
+                        Path invDir = mustPath(a, "--inventory");
+                        String chunkHex = a.get("--chunk");
+                        if (chunkHex==null || chunkHex.length()!=64) throw new IllegalArgumentException("--chunk <sha256hex> required");
+                        Inventory.locate(invDir, chunkHex, a.get("--repo"));
+                    }
+                    case "suggest" -> {
+                        Path invDir = mustPath(a, "--inventory");
+                        Path repo = a.containsKey("--repo") ? mustPath(a, "--repo") : null;
+                        String snapshot = a.get("--snapshot");
+                        Path manifest = a.containsKey("--manifest") ? mustPath(a, "--manifest") : null;
+                        String onlyFile = a.get("--only-file");
+                        String onlyPrefix = a.get("--only-prefix");
+                        Integer maxDrives = a.containsKey("--max-drives") ? Integer.valueOf(a.get("--max-drives")) : null;
+                        String pass = passFrom(a);
+                        Inventory.suggest(invDir, repo, snapshot, manifest, onlyFile, onlyPrefix, pass, maxDrives);
+                    }
+                    default -> { System.out.println("inventory modes: --mode scan|list|locate|suggest"); }
+                }
             }
             default -> usage();
         }
     }
 
+    private static String passFrom(Map<String,String> a) throws IOException {
+        String p = a.get("--passphrase");
+        if (p!=null && !p.isBlank()) return p;
+        String env = System.getenv("COLDSTORE_PASSPHRASE");
+        if (env!=null && !env.isBlank()) return env;
+        return null;
+    }
+
     private static void usage() {
         System.out.println("""
-        ColdStore — incremental backups with FastCDC + per-file Reed–Solomon parity (no deps)
+        ColdStore — FastCDC + RS parity + cross-drive dedupe + AES-256-GCM (chunks/parity) + optional MANIFEST encryption
 
         Commands:
-          init    --repo <path> [--name <RepoName>] [--rs-k 8 --rs-r 2] [--min-chunk 262144 --avg-chunk 1048576 --max-chunk 4194304] [--compress false]
-          info    --repo <path>
-          list    --repo <path>
-          backup  --repo <path> --source <path> [--target-bytes N]
-          restore --repo <path> --dest <path> [--snapshot SNAP_...] [--union-latest true|false]
+          init    --repo <path> [--name <RepoName>]
+                  [--rs-k 8 --rs-r 2]
+                  [--min-chunk 262144 --avg-chunk 1048576 --max-chunk 4194304]
+                  [--compress false]
+                  [--encrypt false] [--obfuscate-parity <true|false>]
+                  [--encrypt-manifest <true|false>]
+                  [--passphrase "..."] [--log info]
 
-        Drive spanning:
-          - Create the SAME repo name on multiple drives (init/backup on each).
-          - Restore will search currently attached repos; if something is missing,
-            it will prompt you to attach another drive and enter its --repo path.
+          info    --repo <path> [--log info]
+          list    --repo <path> [--log info]
+
+          backup  --repo <path> --source <path>
+                  [--global-index <fileOrDir>]
+                  [--target-bytes N]            # hard byte cap (new chunks only)
+                  [--target-fill 0.70]          # % of free space at start (new chunks only)
+                  [--passphrase "..."] [--log off|info|debug|trace]
+
+          restore --repo <path> --dest <path> [--snapshot SNAP_...] [--union-latest true|false]
+                  [--only-file <relpath>] [--only-prefix <relfolder/>]
+                  [--passphrase "..."] [--log off|info|debug|trace]
+
+          restore-plan --global-index <fileOrDir> [--repo <path>] [--snapshot SNAP_... | --manifest <path>]
+                       [--only-file <relpath>] [--only-prefix <relfolder/>] [--max-drives N]
+                       [--passphrase "..."]
+
+          index-compact --global-index <fileOrDir> [--log info]
+
+          inventory --mode scan   --repo <path> --inventory <dir> [--bpe 10]
+                    --mode list   --inventory <dir> [--repo <path>]
+                    --mode locate --inventory <dir> --chunk <sha256hex> [--repo <path>]
+                    --mode suggest --inventory <dir> [--repo <path>] [--snapshot SNAP_... | --manifest <path>]
+                                   [--only-file <relpath>] [--only-prefix <relfolder/>]
+                                   [--max-drives N] [--passphrase "..."]
+
+        Notes:
+          - If any of: --encrypt, --encrypt-manifest, or parity obfuscation are enabled, a master key (key.enc) is created/required.
+          - Encrypted manifests are stored as manifests/SNAP_....jsonl.gcm
+          - Effective write cap = min(target-bytes, target-fill × freeAtStart). Parity/metadata don't count toward the cap.
+          - For multi-drive repos, copy repo.properties and key.enc from the first drive to every additional drive.
+          - The global index now records the primary drive ordinal for each chunk (exact location for planning).
         """);
     }
 
@@ -122,30 +255,33 @@ public class ColdStore {
     }
     private static int pInt(String s){ return Integer.parseInt(s.replace("_","")); }
     private static long pLong(String s){ return Long.parseLong(s.replace("_","")); }
+    private static double pDouble(String s){ return Double.parseDouble(s.replace("_","")); }
 
-    // ======== Repo volume (one physical drive holding a self-contained repo root) ========
+    // ================= Repo =================
 
     static final class RepoProps {
         final String repoName;
+        final String repoId;
+        final String driveId;
         final int rsK, rsR, cMin, cAvg, cMax;
         final boolean compress;
-        RepoProps(String repoName, int rsK, int rsR, int cMin, int cAvg, int cMax, boolean compress) {
-            this.repoName=repoName; this.rsK=rsK; this.rsR=rsR;
-            this.cMin=cMin; this.cAvg=cAvg; this.cMax=cMax; this.compress=compress;
+        final boolean encrypt;
+        final boolean obfuscateParity;
+        final boolean encryptManifest;
+        RepoProps(String repoName, String repoId, String driveId, int rsK,int rsR,int cMin,int cAvg,int cMax,
+                  boolean compress, boolean encrypt, boolean obfuscateParity, boolean encryptManifest) {
+            this.repoName=repoName; this.repoId=repoId; this.driveId=driveId;
+            this.rsK=rsK; this.rsR=rsR; this.cMin=cMin; this.cAvg=cAvg; this.cMax=cMax;
+            this.compress=compress; this.encrypt=encrypt; this.obfuscateParity=obfuscateParity; this.encryptManifest=encryptManifest;
         }
     }
 
     static final class RepoVolume {
-        final Path root;           // repo root on THIS drive (self-contained)
-        final Path propsFile;      // repo.properties
-        final Path chunksDir;      // chunks/aa/bb/<hash>
-        final Path parityDir;      // parity/<SNAP>/<fileIdHash>/stripe-XXXX/...
-        final Path manifestsDir;   // manifests/*.jsonl
-        final Path chunkCatalog;   // volume-local: chunk-ids + sizes
-        final Path snapIndex;      // volume-local: list of snapshots present
+        final Path root, propsFile, keyFile, chunksDir, parityDir, manifestsDir, chunkCatalog, snapIndex;
         final RepoProps props;
 
-        static RepoVolume openOrInit(Path root, String nameOrNull, int k,int r,int cMin,int cAvg,int cMax, boolean compress) throws IOException {
+        static RepoVolume openOrInit(Path root, String nameOrNull, int k,int r,int cMin,int cAvg,int cMax,
+                                     boolean compress, boolean encrypt, boolean obfParity, boolean encManifest) throws IOException {
             Files.createDirectories(root);
             Path propsFile = root.resolve("repo.properties");
             RepoProps props;
@@ -153,29 +289,49 @@ public class ColdStore {
                 Properties p = new Properties();
                 try (InputStream in = Files.newInputStream(propsFile)) { p.load(in); }
                 String nm = p.getProperty("repoName");
-                if (nameOrNull!=null && !nameOrNull.equals(nm))
-                    System.out.println("Warning: ignoring --name; existing repo name is "+nm);
+                String rid = p.getProperty("repo.id");
+                String did = p.getProperty("drive.id");
+                boolean changed = false;
+                if (rid == null) { rid = UUID.randomUUID().toString(); p.setProperty("repo.id", rid); changed = true; }
+                if (did == null) { did = UUID.randomUUID().toString(); p.setProperty("drive.id", did); changed = true; }
+                if (changed) try (OutputStream out = Files.newOutputStream(propsFile, StandardOpenOption.TRUNCATE_EXISTING)) { p.store(out, "ColdStore Repo"); }
+
+                if (nameOrNull!=null && !nameOrNull.equals(nm)) LOG.debug("Ignoring --name; existing repo name is %s", nm);
                 props = new RepoProps(
-                        nm,
+                        nm, rid, did,
                         Integer.parseInt(p.getProperty("rs.k","8")),
                         Integer.parseInt(p.getProperty("rs.r","2")),
                         Integer.parseInt(p.getProperty("cdc.min","262144")),
                         Integer.parseInt(p.getProperty("cdc.avg","1048576")),
                         Integer.parseInt(p.getProperty("cdc.max","4194304")),
-                        Boolean.parseBoolean(p.getProperty("compress","false"))
+                        Boolean.parseBoolean(p.getProperty("compress","false")),
+                        Boolean.parseBoolean(p.getProperty("encrypt","false")),
+                        Boolean.parseBoolean(p.getProperty("parity.obfuscate", "false")),
+                        Boolean.parseBoolean(p.getProperty("manifest.encrypt","false"))
                 );
+                if (encrypt && !props.encrypt) LOG.info("Repo exists without chunk/parity encryption; ignoring --encrypt=true.");
+                if (obfParity && !props.obfuscateParity) LOG.info("Repo exists without parity obfuscation; ignoring request.");
+                if (encManifest && !props.encryptManifest) LOG.info("Repo exists without manifest encryption; ignoring request.");
             } else {
                 String nm = (nameOrNull!=null ? nameOrNull : "Repo");
-                props = new RepoProps(nm,k,r,cMin,cAvg,cMax,compress);
+                String rid = UUID.randomUUID().toString();
+                String did = UUID.randomUUID().toString();
+                props = new RepoProps(nm, rid, did, k,r,cMin,cAvg,cMax, compress, encrypt, obfParity, encManifest);
                 Properties p = new Properties();
                 p.setProperty("repoName", nm);
+                p.setProperty("repo.id", rid);
+                p.setProperty("drive.id", did);
                 p.setProperty("rs.k", String.valueOf(k));
                 p.setProperty("rs.r", String.valueOf(r));
                 p.setProperty("cdc.min", String.valueOf(cMin));
                 p.setProperty("cdc.avg", String.valueOf(cAvg));
                 p.setProperty("cdc.max", String.valueOf(cMax));
                 p.setProperty("compress", String.valueOf(compress));
+                p.setProperty("encrypt", String.valueOf(encrypt));
+                p.setProperty("parity.obfuscate", String.valueOf(obfParity));
+                p.setProperty("manifest.encrypt", String.valueOf(encManifest));
                 try (OutputStream out = Files.newOutputStream(propsFile, StandardOpenOption.CREATE_NEW)) { p.store(out, "ColdStore Repo"); }
+                LOG.debug("Created new repo.properties at %s", propsFile);
             }
             RepoVolume v = new RepoVolume(root, propsFile, props);
             v.ensureLayout();
@@ -184,6 +340,7 @@ public class ColdStore {
 
         private RepoVolume(Path root, Path propsFile, RepoProps props) {
             this.root=root; this.propsFile=propsFile; this.props=props;
+            this.keyFile = root.resolve("key.enc");
             this.chunksDir = root.resolve("chunks");
             this.parityDir = root.resolve("parity");
             this.manifestsDir = root.resolve("manifests");
@@ -197,54 +354,82 @@ public class ColdStore {
             Files.createDirectories(manifestsDir);
             if (!Files.exists(chunkCatalog)) Files.createFile(chunkCatalog);
             if (!Files.exists(snapIndex)) Files.createFile(snapIndex);
+            LOG.debug("Ensured layout under %s", root);
         }
 
         void showInfo() throws IOException {
-            System.out.println("Repo name: " + props.repoName);
+            System.out.println("Repo: " + props.repoName + " (repo.id=" + props.repoId + "  drive.id=" + props.driveId + ")");
+            System.out.println("Encrypt(chunks/parity): "+props.encrypt+"  Compress: "+props.compress);
+            System.out.println("Parity-Obfuscate: "+props.obfuscateParity+"  Manifest-Encrypt: "+props.encryptManifest);
             System.out.println("RS: k="+props.rsK+" r="+props.rsR);
             System.out.println("CDC: min="+props.cMin+" avg="+props.cAvg+" max="+props.cMax);
-            System.out.println("Compression: "+props.compress);
             System.out.println("Root: " + root);
             System.out.println("Snapshots on this drive:");
             listSnapshots();
         }
 
         void listSnapshots() throws IOException {
-            try (DirectoryStream<Path> ds = Files.newDirectoryStream(manifestsDir, "*.jsonl")) {
-                List<String> names = new ArrayList<>();
-                for (Path p : ds) names.add(p.getFileName().toString().replace(".jsonl",""));
-                Collections.sort(names);
-                for (String n: names) System.out.println("  " + n);
-                if (names.isEmpty()) System.out.println("  (none)");
+            List<String> names = new ArrayList<>();
+            try (DirectoryStream<Path> ds = Files.newDirectoryStream(manifestsDir)) {
+                for (Path p : ds) {
+                    String fn = p.getFileName().toString();
+                    if (fn.endsWith(".jsonl")) names.add(fn.substring(0, fn.length()-6));
+                    else if (fn.endsWith(".jsonl.gcm")) names.add(fn.substring(0, fn.length()-10));
+                }
             }
+            Collections.sort(names);
+            for (String n: names) System.out.println("  " + n);
+            if (names.isEmpty()) System.out.println("  (none)");
         }
 
         Path chunkPath(byte[] sha){
-            String hex=hex(sha);
-            return chunksDir.resolve(hex.substring(0,2)).resolve(hex.substring(2,4)).resolve(hex);
+            String h=hex(sha);
+            return chunksDir.resolve(h.substring(0,2)).resolve(h.substring(2,4)).resolve(h);
         }
         Path parityStripeDir(String snapshot, String fileIdHash, int stripeIndex){
             return parityDir.resolve(snapshot).resolve(fileIdHash).resolve(String.format("stripe-%08d", stripeIndex));
         }
+
+        Path manifestPlainPath(String snapshot){ return manifestsDir.resolve(snapshot + ".jsonl"); }
+        Path manifestEncPath(String snapshot){ return manifestsDir.resolve(snapshot + ".jsonl.gcm"); }
+        boolean hasEncManifest(String snapshot){ return Files.exists(manifestEncPath(snapshot)); }
+        boolean hasPlainManifest(String snapshot){ return Files.exists(manifestPlainPath(snapshot)); }
     }
 
-    // ======== BACKUP ========
+    // ================= Backup =================
 
     static final class Backup {
+        static void runBackup(RepoVolume vol, Path source, String snapshotName,
+                              long targetBytesArg, double targetFill,
+                              GlobalIndex gidx, Crypto.Ctx crypto) throws Exception {
 
-        static void runBackup(RepoVolume vol, Path source, String snapshotName, long targetBytes) throws Exception {
+            long freeAtStart = Files.getFileStore(vol.root).getUsableSpace();
+            long fillCap = (targetFill > 0.0 && targetFill <= 1.0) ? (long)Math.floor(freeAtStart * targetFill) : Long.MAX_VALUE;
+            long targetBytes = Math.min(targetBytesArg, fillCap);
+            if (targetBytes == Long.MAX_VALUE) {
+                LOG.info("No write cap set (consider --target-fill 0.70 or --target-bytes N). Free at start: %s", hb(freeAtStart));
+            } else {
+                LOG.info("Effective write cap (new chunks only): %s  [freeAtStart=%s, target-fill=%s, target-bytes=%s]",
+                        hb(targetBytes), hb(freeAtStart),
+                        (targetFill>0? String.format(Locale.ROOT,"%.2f%%", targetFill*100): "n/a"),
+                        (targetBytesArg==Long.MAX_VALUE? "n/a" : hb(targetBytesArg)));
+            }
+
             Files.createDirectories(vol.manifestsDir);
-            Path manifest = vol.manifestsDir.resolve(snapshotName + ".jsonl");
-            try (BufferedWriter mw = Files.newBufferedWriter(manifest, StandardOpenOption.CREATE_NEW)) {
-                Counters c = new Counters();
-                long bytesWrittenThisDrive = 0;
+            Path manifestPlain = vol.manifestPlainPath(snapshotName);
+            if (Files.exists(manifestPlain)) throw new IOException("Manifest already exists: " + manifestPlain);
+            Path manifestTmp = manifestPlain.resolveSibling(manifestPlain.getFileName().toString()+".tmp");
 
-                // walk files (BFS to bound stack)
+            try (BufferedWriter mw = Files.newBufferedWriter(manifestTmp, StandardOpenOption.CREATE_NEW)) {
+                Counters c = new Counters();
+                long newChunkBytesWritten = 0;
+
                 Deque<Path> dq = new ArrayDeque<>();
                 dq.add(source);
-                while (!dq.isEmpty()) {
+                FILES: while (!dq.isEmpty()) {
                     Path p = dq.removeFirst();
                     if (Files.isDirectory(p) && !Files.isSymbolicLink(p)) {
+                        LOG.trace("Scanning directory: %s", p);
                         try (DirectoryStream<Path> ds = Files.newDirectoryStream(p)) {
                             for (Path ch : ds) dq.addLast(ch);
                         }
@@ -252,37 +437,48 @@ public class ColdStore {
                     }
                     if (!Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)) continue;
 
+                    long fileSize = Files.size(p);
+                    String rel = source.toAbsolutePath().normalize().relativize(p.toAbsolutePath().normalize()).toString();
+                    LOG.info("File: %s (%s)", rel, hb(fileSize));
+
                     List<String> chunkIds = new ArrayList<>();
                     List<Integer> chunkSizes = new ArrayList<>();
-                    String rel = source.toAbsolutePath().normalize().relativize(p.toAbsolutePath().normalize()).toString();
 
-                    // streaming chunker
+                    boolean capReached = false;
                     FastCDCStream cdc = new FastCDCStream(vol.props.cMin, vol.props.cAvg, vol.props.cMax);
                     try (InputStream in = Files.newInputStream(p)) {
                         ByteArrayOutputStream chunkBuf = new ByteArrayOutputStream(vol.props.cMax + 16);
-                        int b;
+                        int b, chunkIdx = 0, bytesThisChunk = 0;
                         while ((b=in.read())!=-1) {
                             cdc.update(b & 0xFF);
                             chunkBuf.write(b);
+                            bytesThisChunk++;
                             if (cdc.shouldCut()) {
-                                bytesWrittenThisDrive += processChunk(vol, chunkBuf, chunkIds, chunkSizes, c);
+                                LOG.debug("  CHUNK cut: index=%d size=%s", chunkIdx, hb(bytesThisChunk));
+                                long wrote = processChunk(vol, chunkBuf, chunkIds, chunkSizes, c, gidx, crypto);
+                                newChunkBytesWritten += wrote;
+                                LOG.trace("  CHUNK done: id=%s wrote=%s (cap=%s)", chunkIds.get(chunkIds.size()-1), hb(wrote), hb(targetBytes));
                                 cdc.resetForNextChunk();
-                                if (bytesWrittenThisDrive >= targetBytes) {
-                                    System.out.printf("Hit target-bytes (%,d). Stop here and continue on the next drive with the SAME repo name.%n", bytesWrittenThisDrive);
+                                chunkIdx++; bytesThisChunk = 0;
+
+                                if (newChunkBytesWritten >= targetBytes) {
+                                    LOG.info("Target cap reached on this drive (new chunk bytes): %s", hb(newChunkBytesWritten));
+                                    capReached = true;
                                     break;
                                 }
                             }
                         }
-                        if (chunkBuf.size()>0) {
-                            bytesWrittenThisDrive += processChunk(vol, chunkBuf, chunkIds, chunkSizes, c);
+                        if (!capReached && chunkBuf.size()>0) {
+                            LOG.debug("  CHUNK cut (final): index=%d size=%s", chunkIds.size(), hb(chunkBuf.size()));
+                            long wrote = processChunk(vol, chunkBuf, chunkIds, chunkSizes, c, gidx, crypto);
+                            newChunkBytesWritten += wrote;
+                            LOG.trace("  CHUNK done: id=%s wrote=%s (cap=%s)", chunkIds.get(chunkIds.size()-1), hb(wrote), hb(targetBytes));
                         }
                     }
 
-                    // per-file parity stripes
-                    writeParityForFile(vol, snapshotName, rel, chunkIds, chunkSizes, c);
+                    writeParityForFile(vol, snapshotName, rel, chunkIds, chunkSizes, c, crypto);
 
-                    // record manifest line
-                    mw.write("{\"path\":\""+jesc(rel)+"\",\"bytes\":"+Files.size(p)+",\"chunks\":[");
+                    mw.write("{\"path\":\""+jesc(rel)+"\",\"bytes\":"+fileSize+",\"chunks\":[");
                     for (int i=0;i<chunkIds.size();i++){
                         if (i>0) mw.write(",");
                         mw.write("\""+chunkIds.get(i)+"\"");
@@ -290,282 +486,313 @@ public class ColdStore {
                     mw.write("]}\n");
                     mw.flush();
 
-                    if (bytesWrittenThisDrive >= targetBytes) break;
+                    if (newChunkBytesWritten >= targetBytes) break FILES;
                 }
 
-                // index snapshot on this drive
                 try (FileChannel ch = FileChannel.open(vol.snapIndex, StandardOpenOption.APPEND)) {
                     ch.write(ByteBuffer.wrap((snapshotName+"\n").getBytes()));
                     ch.force(true);
                 }
 
-                System.out.printf(Locale.ROOT,
-                        "Backup complete on this drive: snapshot=%s newChunks=%d reused=%d bytesWritten=%,d%n",
-                        snapshotName, c.newChunks, c.reusedChunks, c.bytesWritten);
+                Files.move(manifestTmp, manifestPlain, StandardCopyOption.ATOMIC_MOVE);
+                if (vol.props.encryptManifest) {
+                    Path enc = vol.manifestEncPath(snapshotName);
+                    LOG.info("Encrypting manifest -> %s", enc.getFileName());
+                    Crypto.encryptFile(manifestPlain, enc, crypto, Crypto.MANIFEST_MAGIC);
+                    Files.deleteIfExists(manifestPlain);
+                }
+
+                LOG.info("Backup complete on this drive: snapshot=%s", snapshotName);
+            } finally {
+                Files.deleteIfExists(manifestTmp);
             }
         }
 
-        private static long processChunk(RepoVolume vol, ByteArrayOutputStream buf, List<String> chunkIds, List<Integer> chunkSizes, Counters c) throws Exception {
+        /** Returns bytes actually written for NEW chunk (post-compress/encrypt). Returns 0 on dedupe or already-present. */
+        private static long processChunk(RepoVolume vol, ByteArrayOutputStream buf, List<String> chunkIds, List<Integer> chunkSizes,
+                                         Counters c, GlobalIndex gidx, Crypto.Ctx crypto) throws Exception {
             byte[] raw = buf.toByteArray();
             buf.reset();
             byte[] sha = sha256(raw);
+            String cidHex = hex(sha);
+
+            if (gidx != null) {
+                boolean in = gidx.contains(sha);
+                LOG.trace("    IDX check: %s -> %s", cidHex.substring(0,16), in ? "present" : "absent");
+                if (in) {
+                    chunkIds.add(cidHex);
+                    chunkSizes.add(raw.length);
+                    c.reusedChunks++;
+                    LOG.debug("    SKIP write (cross-drive dedupe): %s", cidHex.substring(0,16));
+                    return 0L;
+                }
+            }
+
             Path dest = vol.chunkPath(sha);
             if (Files.exists(dest)) {
                 c.reusedChunks++;
-            } else {
-                Files.createDirectories(dest.getParent());
-                Path tmp = dest.resolveSibling(dest.getFileName().toString()+".tmp");
-                try (OutputStream out = Files.newOutputStream(tmp, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-                     BufferedOutputStream bos = new BufferedOutputStream(out);
-                     OutputStream payload = vol.props.compress ? new GZIPOutputStream(bos, true) : bos) {
-                    payload.write(raw);
-                }
-                try {
-                    Files.move(tmp, dest, StandardCopyOption.ATOMIC_MOVE);
-                } catch (FileAlreadyExistsException e) { Files.deleteIfExists(tmp); }
-                try (FileChannel ch = FileChannel.open(dest, StandardOpenOption.READ)) { ch.force(true); }
-                long sz = Files.size(dest);
-                try (FileChannel ch = FileChannel.open(vol.chunkCatalog, StandardOpenOption.APPEND)) {
-                    ch.write(ByteBuffer.wrap((hex(sha)+"\t"+sz+"\n").getBytes()));
-                    ch.force(true);
-                }
-                c.newChunks++; c.bytesWritten+=sz;
+                LOG.debug("    REUSE (exists on this drive): %s", dest);
+                chunkIds.add(cidHex);
+                chunkSizes.add(raw.length);
+                return 0L;
             }
-            String cid = hex(sha);
-            chunkIds.add(cid);
-            chunkSizes.add(raw.length); // store original size for trimming after parity decode
-            return Files.size(vol.chunkPath(sha)); // count compressed size if compression enabled
+
+            Files.createDirectories(dest.getParent());
+            Path tmp = dest.resolveSibling(dest.getFileName().toString()+".tmp");
+
+            byte[] payload = vol.props.compress ? gzip(raw) : raw;
+            if (crypto.enabledForChunks()) payload = crypto.encryptWithMagic(payload, Crypto.CHUNK_MAGIC);
+
+            try (OutputStream out = Files.newOutputStream(tmp, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                out.write(payload);
+            }
+            try { Files.move(tmp, dest, StandardCopyOption.ATOMIC_MOVE); } catch (FileAlreadyExistsException e) { Files.deleteIfExists(tmp); }
+            try (FileChannel ch = FileChannel.open(dest, StandardOpenOption.READ)) { ch.force(true); }
+            long sz = Files.size(dest);
+            try (FileChannel ch = FileChannel.open(vol.chunkCatalog, StandardOpenOption.APPEND)) {
+                ch.write(ByteBuffer.wrap((cidHex+"\t"+sz+"\n").getBytes()));
+                ch.force(true);
+            }
+            c.newChunks++; c.bytesWritten+=sz;
+            LOG.debug("    WRITE chunk: id=%s stored=%s at %s", cidHex.substring(0,16), hb(sz), dest);
+            if (gidx != null) { gidx.add(sha, gidx.currentDriveOrdinal()); LOG.trace("    IDX add (driveOrd=%d): %s", gidx.currentDriveOrdinal(), cidHex.substring(0,16)); }
+
+            chunkIds.add(cidHex);
+            chunkSizes.add(raw.length);
+            return sz;
         }
 
         private static void writeParityForFile(RepoVolume vol, String snapshot, String relPath,
-                                               List<String> chunkIds, List<Integer> sizes, Counters c) throws Exception {
+                                               List<String> chunkIds, List<Integer> sizes, Counters c, Crypto.Ctx crypto) throws Exception {
             int K = vol.props.rsK, R = vol.props.rsR;
             if (K<=0 || R<=0) return;
-            String fileIdHash = hex(sha256(relPath.getBytes("UTF-8")));
+
+            String fileIdHash = crypto.fileIdHash(vol.props, relPath);
             ReedSolomon rs = new ReedSolomon(K, R);
 
-            // walk stripes of K data chunks
             for (int base=0, stripeIdx=0; base<chunkIds.size(); base+=K, stripeIdx++) {
                 int end = Math.min(base+K, chunkIds.size());
-                int kThis = end - base;
-                if (kThis < K) {
-                    // still make a stripe (pad zeros) so tails are recoverable
+
+                boolean allLocal = true;
+                for (int i=base;i<end;i++) {
+                    String cid = chunkIds.get(i);
+                    Path path = vol.chunkPath(unhex(cid));
+                    if (!Files.exists(path)) { allLocal = false; break; }
+                }
+                if (!allLocal) {
+                    LOG.trace("  PARITY skip (not all shards local): file=%s stripe=%d", relPath, stripeIdx);
+                    continue;
                 }
 
-                // gather data shards (decompressed)
                 List<byte[]> data = new ArrayList<>();
                 int maxLen = 0;
                 for (int i=base;i<end;i++) {
                     String cid = chunkIds.get(i);
                     Path path = vol.chunkPath(unhex(cid));
-                    byte[] raw = readMaybeGunzip(path);
+                    byte[] raw = readPayload(path, crypto, true);
                     data.add(raw);
                     maxLen = Math.max(maxLen, raw.length);
                 }
-                // pad to K
                 while (data.size()<K) data.add(new byte[0]);
 
-                // align shard buffers to equal length
                 byte[][] dataAligned = new byte[K][maxLen];
                 int[] realSizes = new int[K];
-                for (int i=0;i<K;i++){
-                    byte[] src = data.get(i);
-                    realSizes[i] = src.length;
-                    System.arraycopy(src, 0, dataAligned[i], 0, src.length);
-                }
+                for (int i=0;i<K;i++){ byte[] src = data.get(i); realSizes[i] = src.length; System.arraycopy(src,0,dataAligned[i],0,src.length); }
 
-                // compute parity R shards
                 byte[][] parity = new byte[R][maxLen];
                 rs.encode(dataAligned, parity);
 
-                // write parity stripe + sidecar
                 Path sdir = vol.parityStripeDir(snapshot, fileIdHash, stripeIdx);
                 Files.createDirectories(sdir);
 
+                long totalParity = 0;
                 for (int pi=0; pi<R; pi++) {
                     Path pf = sdir.resolve("p_"+pi);
-                    try (OutputStream os = Files.newOutputStream(pf, StandardOpenOption.CREATE_NEW)) { os.write(parity[pi]); }
+                    byte[] outBytes = parity[pi];
+                    if (crypto.enabledForChunks()) outBytes = crypto.encryptWithMagic(outBytes, Crypto.CHUNK_MAGIC);
+                    try (OutputStream os = Files.newOutputStream(pf, StandardOpenOption.CREATE_NEW)) { os.write(outBytes); }
                     try (FileChannel ch = FileChannel.open(pf, StandardOpenOption.READ)) { ch.force(true); }
-                    c.bytesWritten += Files.size(pf);
+                    long sz = Files.size(pf);
+                    c.bytesWritten += sz; totalParity += sz;
                 }
 
-                // sidecar.json (tiny; lists the K chunk IDs for this stripe + their true sizes)
                 StringBuilder sb = new StringBuilder();
                 sb.append("{\"k\":").append(K).append(",\"r\":").append(R).append(",\"chunks\":[");
-                for (int i=0;i<K;i++){
-                    if (i>0) sb.append(',');
-                    String cid = (base+i<chunkIds.size()) ? chunkIds.get(base+i) : "";
-                    sb.append('"').append(cid).append('"');
-                }
+                for (int i=0;i<K;i++){ if (i>0) sb.append(','); String cid=(base+i<chunkIds.size())?chunkIds.get(base+i):""; sb.append('"').append(cid).append('"'); }
                 sb.append("],\"sizes\":[");
-                for (int i=0;i<K;i++){
-                    if (i>0) sb.append(',');
-                    int sizeVal = (base+i<chunkIds.size()) ? realSizes[i] : 0;
-					sb.append(sizeVal);
-                }
+                for (int i=0;i<K;i++){ if (i>0) sb.append(','); int sizeVal=(base+i<chunkIds.size())?realSizes[i]:0; sb.append(sizeVal); }
                 sb.append("]}");
                 Path sidecar = sdir.resolve("sidecar.json");
-                try (BufferedWriter bw = Files.newBufferedWriter(sidecar, StandardOpenOption.CREATE_NEW)) {
-                    bw.write(sb.toString());
-                }
+                try (BufferedWriter bw = Files.newBufferedWriter(sidecar, StandardOpenOption.CREATE_NEW)) { bw.write(sb.toString()); }
                 try (FileChannel ch = FileChannel.open(sidecar, StandardOpenOption.READ)) { ch.force(true); }
+
+                LOG.debug("  PARITY stripe: file=%s stripe=%d shards=%d+%d shardSize=%s dir=%s totalWritten=%s",
+                        relPath, stripeIdx, K, R, hb(maxLen), sdir, hb(totalParity));
             }
         }
 
-        static final class Counters {
-            long newChunks=0, reusedChunks=0, bytesWritten=0;
-        }
+        static final class Counters { long newChunks=0, reusedChunks=0, bytesWritten=0; }
     }
 
-    // ======== RESTORE ========
+    // ================= Restore =================
 
     static final class Restore {
 
-        static void run(List<RepoVolume> attached, String snapshot, boolean unionLatest, Path dest) throws Exception {
+        static void run(List<RepoVolume> attached, String snapshot, boolean unionLatest, Path dest, Crypto.Ctx crypto,
+                        String onlyFile, String onlyPrefix) throws Exception {
             Files.createDirectories(dest);
-
-            if (unionLatest && snapshot != null)
-                throw new IllegalArgumentException("Use either --snapshot or --union-latest, not both.");
+            if (unionLatest && snapshot != null) throw new IllegalArgumentException("Use either --snapshot or --union-latest, not both.");
 
             if (snapshot != null) {
-                // Restore a specific snapshot: find a repo that has its manifest, else prompt to attach.
                 RepoVolume src = requireRepoWithSnapshot(attached, snapshot);
-                restoreSnapshot(attached, src, snapshot, dest);
+                restoreSnapshot(attached, src, snapshot, dest, crypto, onlyFile, onlyPrefix);
             } else if (unionLatest) {
-                // Restore union of latest snapshots present on each attached repo (best-effort across drives).
                 Set<String> done = new HashSet<>();
                 for (;;) {
                     boolean progressed = false;
-                    for (int i=0;i<attached.size();i++) {
-                        String latest = latestSnapshot(attached.get(i));
-                        if (latest!=null && done.add(attached.get(i).root.toString()+":"+latest)) {
-                            System.out.println("Restoring from drive "+attached.get(i).root+" snapshot "+latest);
-                            restoreSnapshot(attached, attached.get(i), latest, dest);
+                    for (RepoVolume v : attached) {
+                        String latest = latestSnapshot(v);
+                        if (latest!=null && done.add(v.root.toString()+":"+latest)) {
+                            LOG.info("Restoring latest from %s: %s", v.root, latest);
+                            restoreSnapshot(attached, v, latest, dest, crypto, onlyFile, onlyPrefix);
                             progressed = true;
                         }
                     }
                     if (!progressed) break;
-                    // Ask to attach another drive for more "latest" snapshots?
                     if (promptYesNo("Attach another repo drive and continue union restore? [y/N] ")) {
                         RepoVolume nv = promptAttachMore(attached.get(0).props.repoName);
                         if (nv!=null) attached.add(nv);
                     } else break;
                 }
-                System.out.println("Union restore complete.");
+                LOG.info("Union restore complete.");
             } else {
                 throw new IllegalArgumentException("Provide --snapshot SNAP_... or --union-latest true");
             }
         }
 
-        private static void restoreSnapshot(List<RepoVolume> attached, RepoVolume manifestRepo, String snapshot, Path dest) throws Exception {
-            Path manifest = manifestRepo.manifestsDir.resolve(snapshot + ".jsonl");
-            if (!Files.exists(manifest)) {
-                // maybe on another attached drive?
-                for (RepoVolume v: attached) {
-                    Path m = v.manifestsDir.resolve(snapshot + ".jsonl");
-                    if (Files.exists(m)) { manifestRepo = v; manifest = m; break; }
-                }
-                if (!Files.exists(manifest)) {
-                    // ask user to attach the drive that has this manifest
-                    System.out.println("Snapshot "+snapshot+" not found on attached drives.");
-                    RepoVolume nv = promptAttachMore(manifestRepo.props.repoName);
-                    if (nv==null) throw new FileNotFoundException("Snapshot manifest not found.");
-                    attached.add(nv);
-                    restoreSnapshot(attached, nv, snapshot, dest);
-                    return;
-                }
+        private static void restoreSnapshot(List<RepoVolume> attached, RepoVolume manifestRepo, String snapshot, Path dest,
+                                            Crypto.Ctx crypto, String onlyFile, String onlyPrefix) throws Exception {
+            Path manifestPath = locateManifest(attached, snapshot);
+            if (manifestPath == null) {
+                LOG.info("Snapshot %s not found on attached drives.", snapshot);
+                RepoVolume nv = promptAttachMore(manifestRepo.props.repoName);
+                if (nv==null) throw new FileNotFoundException("Snapshot manifest not found.");
+                attached.add(nv);
+                restoreSnapshot(attached, nv, snapshot, dest, crypto, onlyFile, onlyPrefix);
+                return;
             }
 
-            try (BufferedReader br = Files.newBufferedReader(manifest)) {
+            LOG.info("Restoring snapshot %s using manifest at %s", snapshot, manifestPath);
+            try (BufferedReader br = openManifestReader(manifestPath, crypto)) {
                 String line;
                 while ((line=br.readLine())!=null) {
-                    // parse minimal JSON (path + chunks)
                     String rel = extractJsonValue(line, "path");
+
+                    // FILTERS
+                    if (onlyFile != null && !onlyFile.isBlank() && !rel.equals(onlyFile)) continue;
+                    if (onlyPrefix != null && !onlyPrefix.isBlank() && !rel.startsWith(onlyPrefix)) continue;
+
                     String chunksArr = extractArray(line, "chunks");
                     List<String> cids = chunksArr.isBlank() ? List.of() : Arrays.asList(chunksArr.split(","));
                     Path out = dest.resolve(rel);
                     Files.createDirectories(out.getParent());
+                    LOG.debug("  Restore file: %s (chunks=%d)", rel, cids.size());
 
                     try (OutputStream os = Files.newOutputStream(out, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
                         for (int idx=0; idx<cids.size(); idx++) {
                             String cid = stripQuotes(cids.get(idx));
-                            byte[] chunk = findChunkAcross(attached, cid);
-                            if (chunk != null) {
-                                os.write(chunk);
-                                continue;
-                            }
-                            // Try parity reconstruction (per-file stripe)
-                            byte[] repaired = recoverFromParity(attached, manifestRepo, snapshot, rel, idx, cids);
-                            if (repaired != null) {
-                                os.write(repaired);
-                                continue;
-                            }
-                            // Need another drive
-                            System.out.println("Missing chunk "+cid+" for "+rel+" (snapshot "+snapshot+").");
+                            byte[] chunk = findChunkAcross(attached, cid, crypto);
+                            if (chunk != null) { LOG.trace("    found chunk: %s", cid.substring(0,16)); os.write(chunk); continue; }
+                            byte[] repaired = recoverFromParity(attached, manifestRepo, snapshot, rel, idx, cids, crypto);
+                            if (repaired != null) { LOG.debug("    repaired from parity: %s", cid.substring(0,16)); os.write(repaired); continue; }
+                            LOG.info("    missing chunk %s. Prompting for another drive...", cid.substring(0,16));
                             RepoVolume nv = promptAttachMore(manifestRepo.props.repoName);
                             if (nv==null) throw new FileNotFoundException("Unrecoverable: missing chunk "+cid);
                             attached.add(nv);
-                            idx--; // retry this chunk with new drive attached
+                            idx--;
                         }
                     }
                 }
             }
-            System.out.println("Snapshot restore complete: " + snapshot);
+            LOG.info("Snapshot restore complete: %s", snapshot);
+        }
+
+        private static Path locateManifest(List<RepoVolume> attached, String snapshot) {
+            for (RepoVolume v : attached) {
+                Path enc = v.manifestEncPath(snapshot);
+                if (Files.exists(enc)) return enc;
+                Path plain = v.manifestPlainPath(snapshot);
+                if (Files.exists(plain)) return plain;
+            }
+            return null;
+        }
+
+        private static BufferedReader openManifestReader(Path manifestPath, Crypto.Ctx crypto) throws Exception {
+            String fn = manifestPath.getFileName().toString();
+            InputStream in = Files.newInputStream(manifestPath);
+            if (fn.endsWith(".jsonl.gcm")) {
+                in = crypto.decryptingInputStream(in, Crypto.MANIFEST_MAGIC);
+            }
+            return new BufferedReader(new InputStreamReader(in));
         }
 
         private static String latestSnapshot(RepoVolume v) throws IOException {
-            try (DirectoryStream<Path> ds = Files.newDirectoryStream(v.manifestsDir, "*.jsonl")) {
-                String best=null; for (Path p: ds){
-                    String n=p.getFileName().toString().replace(".jsonl","");
-                    if (best==null || n.compareTo(best)>0) best=n;
+            List<String> names = new ArrayList<>();
+            try (DirectoryStream<Path> ds = Files.newDirectoryStream(v.manifestsDir)) {
+                for (Path p : ds) {
+                    String fn = p.getFileName().toString();
+                    if (fn.endsWith(".jsonl")) names.add(fn.substring(0, fn.length()-6));
+                    else if (fn.endsWith(".jsonl.gcm")) names.add(fn.substring(0, fn.length()-10));
                 }
-                return best;
             }
+            if (names.isEmpty()) return null;
+            Collections.sort(names);
+            return names.get(names.size()-1);
         }
 
         private static RepoVolume requireRepoWithSnapshot(List<RepoVolume> attached, String snapshot) throws Exception {
-            for (RepoVolume v: attached) {
-                if (Files.exists(v.manifestsDir.resolve(snapshot+".jsonl"))) return v;
-            }
-            System.out.println("Snapshot not found on attached drives.");
+            Path p = locateManifest(attached, snapshot);
+            if (p != null) return attached.stream().filter(v -> p.startsWith(v.root)).findFirst().orElse(attached.get(0));
+            LOG.info("Snapshot %s not found on attached drives.", snapshot);
             RepoVolume nv = promptAttachMore(attached.get(0).props.repoName);
             if (nv==null) throw new FileNotFoundException("Snapshot manifest not found.");
             attached.add(nv);
             return requireRepoWithSnapshot(attached, snapshot);
         }
 
-        private static byte[] findChunkAcross(List<RepoVolume> attached, String cid) throws Exception {
+        private static byte[] findChunkAcross(List<RepoVolume> attached, String cid, Crypto.Ctx crypto) throws Exception {
             byte[] sha = unhex(cid);
             for (RepoVolume v: attached) {
                 Path p = v.chunkPath(sha);
-                if (Files.exists(p)) return readMaybeGunzip(p);
+                if (Files.exists(p)) { LOG.trace("      locating chunk on %s", p); return readPayload(p, crypto, true); }
             }
             return null;
         }
 
         private static byte[] recoverFromParity(List<RepoVolume> attached, RepoVolume manifestRepo,
                                                 String snapshot, String relPath, int chunkIndexInFile,
-                                                List<String> cids) throws Exception {
+                                                List<String> cids, Crypto.Ctx crypto) throws Exception {
             int K = manifestRepo.props.rsK, R = manifestRepo.props.rsR;
             if (K<=0 || R<=0) return null;
-            String fileIdHash = hex(sha256(relPath.getBytes("UTF-8")));
+
+            List<String> candidates = new ArrayList<>();
+            candidates.add(hex(sha256(relPath.getBytes("UTF-8")))); // legacy
+            if (crypto.anyCrypto()) candidates.add(crypto.hmacHex(relPath.getBytes("UTF-8"))); // obfuscated
+
             int stripeIdx = chunkIndexInFile / K;
             int missingIdx = chunkIndexInFile % K;
-            String sidecarName = "sidecar.json";
 
-            // find a drive that has the parity stripe directory
             Path sdir = null;
-            RepoVolume sVol = null;
             for (RepoVolume v: attached) {
-                Path candidate = v.parityStripeDir(snapshot, fileIdHash, stripeIdx);
-                if (Files.isDirectory(candidate) && Files.exists(candidate.resolve(sidecarName))) {
-                    sdir = candidate; sVol = v; break;
+                for (String fileIdHash : candidates) {
+                    Path candidate = v.parityStripeDir(snapshot, fileIdHash, stripeIdx);
+                    if (Files.isDirectory(candidate) && Files.exists(candidate.resolve("sidecar.json"))) { sdir=candidate; break; }
                 }
+                if (sdir!=null) break;
             }
             if (sdir == null) return null;
 
-            // read sidecar
-            String sidecar = Files.readString(sdir.resolve(sidecarName));
+            String sidecar = Files.readString(sdir.resolve("sidecar.json"));
             int k = Integer.parseInt(extractJsonValue(sidecar, "k"));
             int r = Integer.parseInt(extractJsonValue(sidecar, "r"));
             String idArr = extractArray(sidecar, "chunks");
@@ -574,29 +801,26 @@ public class ColdStore {
             String[] szs = szArr.isBlank()? new String[0] : szArr.split(",");
             if (k != K || r != R) return null;
 
-            // gather K data shards (from any attached volume), aligned to max size
             byte[][] data = new byte[K][];
             int maxLen=0;
             for (int i=0;i<K;i++){
                 String cid = stripQuotes(ids[i]);
                 if (cid.isEmpty()) { data[i] = new byte[0]; }
                 else {
-                    byte[] bytes = findChunkAcross(attached, cid);
-                    data[i] = (bytes!=null) ? bytes : null;
+                    byte[] bytes = findChunkAcross(attached, cid, crypto);
+                    data[i] = (bytes!=null) ? bytes : new byte[0];
                     if (bytes!=null) maxLen=Math.max(maxLen, bytes.length);
                 }
             }
-            for (int i=0;i<K;i++) if (data[i]==null) data[i]=new byte[0];
             byte[][] dataAligned = new byte[K][maxLen];
             for (int i=0;i<K;i++) System.arraycopy(data[i],0,dataAligned[i],0,data[i].length);
 
-            // read parity shards from the stripe directory
             List<byte[]> parity = new ArrayList<>();
             for (int pi=0; pi<R; pi++) {
                 Path pf = sdir.resolve("p_"+pi);
-                if (Files.exists(pf)) parity.add(Files.readAllBytes(pf));
+                if (Files.exists(pf)) parity.add(readPayload(pf, crypto, false));
             }
-            if (parity.size()<1) return null;
+            if (parity.isEmpty()) return null;
             for (int i=0;i<parity.size();i++){
                 if (parity.get(i).length!=maxLen){
                     byte[] exp = new byte[maxLen];
@@ -609,13 +833,8 @@ public class ColdStore {
             byte[] rec = rs.decodeSingle(dataAligned, parity, missingIdx);
             if (rec==null) return null;
 
-            // trim to true size from sidecar
             int trueSize = Integer.parseInt(stripQuotes(szs[missingIdx]));
-            if (trueSize < rec.length) {
-                byte[] trimmed = new byte[trueSize];
-                System.arraycopy(rec, 0, trimmed, 0, trueSize);
-                return trimmed;
-            }
+            if (trueSize < rec.length) { byte[] trimmed = new byte[trueSize]; System.arraycopy(rec,0,trimmed,0,trueSize); return trimmed; }
             return rec;
         }
 
@@ -626,11 +845,9 @@ public class ColdStore {
             if (line==null || line.isBlank()) return null;
             Path p = Paths.get(line.trim()).toAbsolutePath().normalize();
             if (!Files.isDirectory(p)) { System.out.println("Not a directory."); return null; }
-            RepoVolume v = RepoVolume.openOrInit(p, null,8,2,262144,1048576,4194304,false);
-            if (!v.props.repoName.equals(repoName)) {
-                System.out.println("Repo name mismatch: expected "+repoName+" got "+v.props.repoName);
-                return null;
-            }
+            RepoVolume v = RepoVolume.openOrInit(p, null,8,2,262144,1048576,4194304,false,false,false,false);
+            if (!v.props.repoName.equals(repoName)) { System.out.println("Repo name mismatch: expected "+repoName+" got "+v.props.repoName); return null; }
+            LOG.info("Attached additional repo drive at %s", p);
             return v;
         }
 
@@ -642,80 +859,354 @@ public class ColdStore {
         }
     }
 
-    // ======== FastCDC (streaming) ========
+    // ================= Planner (restore plan via location-aware global index) =================
 
-    static final class FastCDCStream {
-        private final int min, avg, max;
-        private final int avgMask, maxMask;
-        private int h=0, n=0;
-        private static final int[] GEAR = new int[256];
-        static {
-            long seed=0x9E3779B97F4A7C15L;
-            for (int i=0;i<256;i++){ seed^=seed<<13; seed^=seed>>>7; seed^=seed<<17; GEAR[i]=(int)seed; }
+    static final class Planner {
+        static void planWithGlobalIndex(Path idxPath, Path repoPathOrNull, String snapshot, Path manifestPathOrNull,
+                                        String onlyFile, String onlyPrefix, String passphrase, Integer maxDrives) throws Exception {
+            GlobalIndex gidx = GlobalIndex.open(idxPath, null, null, null, null);
+
+            RepoVolume repoVol = null;
+            Crypto.Ctx crypto = null;
+            Path manifest = manifestPathOrNull;
+            if (manifest == null) {
+                if (repoPathOrNull == null || snapshot == null)
+                    throw new IllegalArgumentException("Provide either --manifest, or both --repo and --snapshot");
+                repoVol = RepoVolume.openOrInit(repoPathOrNull, null,8,2,262144,1048576,4194304,false,false,false,false);
+                crypto = Crypto.ctxForRepo(repoVol, passphrase);
+                if (repoVol.hasEncManifest(snapshot)) manifest = repoVol.manifestEncPath(snapshot);
+                else if (repoVol.hasPlainManifest(snapshot)) manifest = repoVol.manifestPlainPath(snapshot);
+                else throw new FileNotFoundException("Snapshot manifest not found on provided --repo");
+            } else {
+                if (repoPathOrNull != null) {
+                    repoVol = RepoVolume.openOrInit(repoPathOrNull, null,8,2,262144,1048576,4194304,false,false,false,false);
+                    crypto = Crypto.ctxForRepo(repoVol, passphrase);
+                }
+            }
+
+            // Gather needed chunks
+            List<String> needed = new ArrayList<>();
+            try (BufferedReader br = openManifestReaderForPlanner(manifest, crypto)) {
+                String line;
+                while ((line=br.readLine())!=null) {
+                    String rel = extractJsonValue(line, "path");
+                    if (onlyFile != null && !onlyFile.isBlank() && !rel.equals(onlyFile)) continue;
+                    if (onlyPrefix != null && !onlyPrefix.isBlank() && !rel.startsWith(onlyPrefix)) continue;
+                    String arr = extractArray(line, "chunks");
+                    if (!arr.isBlank()) for (String tok : arr.split(",")) needed.add(stripQuotes(tok));
+                }
+            }
+            if (needed.isEmpty()) { System.out.println("No matching paths or chunks in manifest."); return; }
+
+            // Tally by drive ordinal
+            Map<Integer, Long> tally = new HashMap<>();
+            long unknown = 0;
+            for (String hex : needed) {
+                int ord = gidx.location(unhex(hex));
+                if (ord >= 0) tally.put(ord, tally.getOrDefault(ord,0L)+1);
+                else unknown++;
+            }
+
+            // Sort drives by coverage
+            List<Integer> ords = new ArrayList<>(tally.keySet());
+            ords.sort((a,b)->Long.compare(tally.get(b), tally.get(a)));
+
+            long covered = needed.size() - unknown;
+            System.out.printf(Locale.ROOT, "Chunks needed: %,d   Known in index: %,d (%.2f%%)   Unknown: %,d%n",
+                    needed.size(), covered, 100.0*covered/needed.size(), unknown);
+
+            if (ords.isEmpty()) {
+                System.out.println("No drive locations known in the index. Ensure you used --global-index during backups and ran index-compact occasionally.");
+                return;
+            }
+
+            System.out.println("Suggested drive attach order (by chunk coverage):");
+            int shown = 0;
+            for (Integer ord : ords) {
+                if (maxDrives!=null && shown>=maxDrives) break;
+                String label = gidx.driveLabel(ord);
+                String driveId = gidx.driveId(ord);
+                long cnt = tally.get(ord);
+                System.out.printf(Locale.ROOT, "  %d) ord=%d  chunks≈%,d  drive.id=%s  label=%s%n", ++shown, ord, cnt, driveId, label);
+            }
+            if (maxDrives!=null && ords.size()>maxDrives) {
+                System.out.printf(Locale.ROOT, "...and %d more drives with smaller coverage%n", ords.size()-maxDrives);
+            }
         }
-        FastCDCStream(int min, int avg, int max){
-            if (!(min<avg && avg<max)) throw new IllegalArgumentException("min<avg<max required");
-            this.min=min; this.avg=avg; this.max=max;
-            this.avgMask = maskFor(avg);
-            this.maxMask = maskFor(max);
+
+        private static BufferedReader openManifestReaderForPlanner(Path manifestPath, Crypto.Ctx crypto) throws Exception {
+            String fn = manifestPath.getFileName().toString();
+            InputStream in = Files.newInputStream(manifestPath);
+            if (fn.endsWith(".jsonl.gcm")) {
+                if (crypto==null || crypto.master==null) throw new IOException("Encrypted manifest: provide --repo and --passphrase to decrypt.");
+                in = crypto.decryptingInputStream(in, Crypto.MANIFEST_MAGIC);
+            }
+            return new BufferedReader(new InputStreamReader(in));
         }
-        private int maskFor(int size){ int n=0; while ((1<<n)<size) n++; return ~((1<<n)-1); }
-        void update(int b){
-            n++; h = (h<<1) + GEAR[b & 0xFF];
-        }
-        boolean shouldCut(){
-            if (n<min) return false;
-            if ((h & avgMask)==0) return true;
-            return n>=max;
-        }
-        void resetForNextChunk(){ n=0; h=0; }
     }
 
-    // ======== Reed–Solomon (GF(256), encode + single erasure decode) ========
+    // ================= Inventory (Bloom filters per drive; optional) =================
 
-    static final class ReedSolomon {
-        final int K, R;
-        final GF256 gf = new GF256(0x11D);
-        final byte[][] gen; // R x K Vandermonde
+    static final class Inventory {
+        private static final byte[] MAGIC = new byte[]{'C','S','I','V','1'};
 
-        ReedSolomon(int K, int R){
-            if (K<=0||R<=0) throw new IllegalArgumentException("K,R>0");
-            this.K=K; this.R=R;
-            this.gen = buildVandermonde(R,K);
-        }
-        private byte[][] buildVandermonde(int rows,int cols){
-            byte[][] m = new byte[rows][cols];
-            for (int r=0;r<rows;r++){
-                byte x=(byte)(r+1), p=1;
-                for (int c=0;c<cols;c++){ m[r][c]=p; p=gf.mul(p,x); }
+        static void scanDrive(RepoVolume v, Path invDir, int bitsPerElement) throws IOException {
+            Files.createDirectories(invDir);
+            long n = countCatalogEntries(v.chunkCatalog);
+            if (n==0) { System.out.println("No entries in chunk_catalog.txt on this drive."); return; }
+
+            int mBits = Math.max(1<<20, nextPow2((int)Math.min(Integer.MAX_VALUE-8L, n * (long)bitsPerElement)));
+            int k = Math.max(1, (int)Math.round((mBits / (double)n) * Math.log(2)));
+
+            LOG.info("Building Bloom filter: entries≈%d, bits=%d (~%.1f MB), k=%d", n, mBits, (mBits/8.0/1024/1024), k);
+            BloomFilter bf = new BloomFilter(mBits, k);
+
+            try (BufferedReader br = Files.newBufferedReader(v.chunkCatalog)) {
+                String s; long i=0;
+                while ((s=br.readLine())!=null) {
+                    int tab = s.indexOf('\t');
+                    if (tab<0) continue;
+                    String hex = s.substring(0, tab);
+                    if (hex.length()!=64) continue;
+                    bf.add(unhex(hex));
+                    if ((++i % 1_000_000)==0) LOG.info("  ... %,d entries added", i);
+                }
             }
-            return m;
+
+            String base = v.props.repoName.replaceAll("[^A-Za-z0-9._-]","_") + "__" + v.props.driveId + ".inv";
+            Path out = invDir.resolve(base);
+
+            try (DataOutputStream dout = new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(out, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)))) {
+                dout.write(MAGIC);
+                dout.writeUTF(v.props.repoId);
+                dout.writeUTF(v.props.repoName);
+                dout.writeUTF(v.props.driveId);
+                dout.writeUTF(v.root.toString());
+                dout.writeLong(Instant.now().getEpochSecond());
+                dout.writeLong(n);
+                dout.writeInt(bf.mBits);
+                dout.writeInt(bf.k);
+                dout.writeInt(bf.bits.length);
+                dout.write(bf.bits);
+            }
+            LOG.info("Inventory written: %s", out);
         }
-        void encode(byte[][] data, byte[][] parity){
-            int len = data[0].length;
-            for (byte[] p : parity) if (p.length!=len) throw new IllegalArgumentException("len mismatch");
-            for (int r=0;r<R;r++){
-                byte[] out = parity[r];
-                for (int i=0;i<len;i++){
-                    int acc=0;
-                    for (int k=0;k<K;k++){
-                        acc ^= gf.mul((byte)(data[k][i] & 0xFF), gen[r][k]) & 0xFF;
-                    }
-                    out[i]=(byte)acc;
+
+        static void list(Path invDir, String repoFilterPathOrNull) throws IOException {
+            String repoIdFilter = null;
+            if (repoFilterPathOrNull != null) {
+                RepoVolume v = RepoVolume.openOrInit(Paths.get(repoFilterPathOrNull), null,8,2,262144,1048576,4194304,false,false,false,false);
+                repoIdFilter = v.props.repoId;
+            }
+            try (DirectoryStream<Path> ds = Files.newDirectoryStream(invDir, "*.inv")) {
+                for (Path p : ds) {
+                    Entry e = readEntry(p);
+                    if (repoIdFilter!=null && !repoIdFilter.equals(e.repoId)) continue;
+                    System.out.printf(Locale.ROOT, "%s  repo=%s  drive=%s  name=%s  entries≈%,d  bits=%,d  k=%d  date=%s%n",
+                            p.getFileName(), e.repoId, e.driveId, e.repoName, e.nEntries, e.bf.mBits, e.bf.k,
+                            Instant.ofEpochSecond(e.timestamp));
                 }
             }
         }
+
+        static void locate(Path invDir, String chunkHex, String repoFilterPathOrNull) throws IOException {
+            byte[] key = unhex(chunkHex);
+            String repoIdFilter = null;
+            if (repoFilterPathOrNull != null) {
+                RepoVolume v = RepoVolume.openOrInit(Paths.get(repoFilterPathOrNull), null,8,2,262144,1048576,4194304,false,false,false,false);
+                repoIdFilter = v.props.repoId;
+            }
+            List<String> hits = new ArrayList<>();
+            try (DirectoryStream<Path> ds = Files.newDirectoryStream(invDir, "*.inv")) {
+                for (Path p : ds) {
+                    Entry e = readEntry(p);
+                    if (repoIdFilter!=null && !repoIdFilter.equals(e.repoId)) continue;
+                    if (e.bf.contains(key)) hits.add(e.label + " (drive.id="+e.driveId+")");
+                }
+            }
+            if (hits.isEmpty()) System.out.println("No likely drives found.");
+            else {
+                System.out.println("Likely present on:");
+                for (String s : hits) System.out.println("  - " + s);
+            }
+        }
+
+        static void suggest(Path invDir, Path repoPathOrNull, String snapshot, Path manifestPathOrNull,
+                            String onlyFile, String onlyPrefix, String passphrase, Integer maxDrives) throws Exception {
+            RepoVolume repoVol = null;
+            Crypto.Ctx crypto = null;
+            String repoId = null;
+            if (repoPathOrNull != null) {
+                repoVol = RepoVolume.openOrInit(repoPathOrNull, null,8,2,262144,1048576,4194304,false,false,false,false);
+                repoId = repoVol.props.repoId;
+                crypto = Crypto.ctxForRepo(repoVol, passphrase);
+            }
+
+            Path manifestPath = manifestPathOrNull;
+            if (manifestPath == null) {
+                if (repoVol == null || snapshot == null) throw new IllegalArgumentException("Provide either --manifest or --repo with --snapshot");
+                if (repoVol.hasEncManifest(snapshot)) manifestPath = repoVol.manifestEncPath(snapshot);
+                else if (repoVol.hasPlainManifest(snapshot)) manifestPath = repoVol.manifestPlainPath(snapshot);
+                else throw new FileNotFoundException("Snapshot manifest not found on provided --repo");
+            }
+
+            List<String> needed = new ArrayList<>();
+            try (BufferedReader br = openManifestReaderForInventory(manifestPath, crypto)) {
+                String line;
+                while ((line=br.readLine())!=null) {
+                    String rel = extractJsonValue(line, "path");
+                    if (onlyFile != null && !onlyFile.isBlank() && !rel.equals(onlyFile)) continue;
+                    if (onlyPrefix != null && !onlyPrefix.isBlank() && !rel.startsWith(onlyPrefix)) continue;
+                    String arr = extractArray(line, "chunks");
+                    if (!arr.isBlank()) for (String tok : arr.split(",")) needed.add(stripQuotes(tok));
+                }
+            }
+            if (needed.isEmpty()) { System.out.println("No matching paths or chunks in manifest."); return; }
+
+            List<Entry> entries = new ArrayList<>();
+            try (DirectoryStream<Path> ds = Files.newDirectoryStream(invDir, "*.inv")) {
+                for (Path p : ds) {
+                    Entry e = readEntry(p);
+                    if (repoId!=null && !repoId.equals(e.repoId)) continue;
+                    entries.add(e);
+                }
+            }
+            if (entries.isEmpty()) { System.out.println("No inventory files found (or none matching repo.id)."); return; }
+
+            Set<String> remaining = new HashSet<>(needed);
+            List<Entry> order = new ArrayList<>();
+            while (!remaining.isEmpty() && (maxDrives==null || order.size()<maxDrives)) {
+                Entry best = null; int bestCover=0;
+                for (Entry e : entries) {
+                    if (order.contains(e)) continue;
+                    int cover=0;
+                    for (String hex : remaining) if (e.bf.contains(unhex(hex))) cover++;
+                    if (cover>bestCover){ best=e; bestCover=cover; }
+                }
+                if (best==null || bestCover==0) break;
+                order.add(best);
+                Iterator<String> it = remaining.iterator();
+                while (it.hasNext()){
+                    String h = it.next();
+                    if (best.bf.contains(unhex(h))) it.remove();
+                }
+            }
+
+            long covered = needed.size() - remaining.size();
+            System.out.printf(Locale.ROOT, "Chunks needed: %,d   Covered by plan: %,d (%.2f%%)   Drives chosen: %d%n",
+                    needed.size(), covered, 100.0*covered/needed.size(), order.size());
+            if (!order.isEmpty()) {
+                System.out.println("Suggested drive attach order:");
+                for (int i=0;i<order.size();i++){
+                    Entry e=order.get(i);
+                    System.out.printf(Locale.ROOT, "  %d) %s  [drive.id=%s]%n", i+1, e.label, e.driveId);
+                }
+            }
+            if (!remaining.isEmpty()) {
+                System.out.printf(Locale.ROOT, "Uncovered chunks: %,d (may be on other drives or not yet scanned into inventory).%n", remaining.size());
+            }
+        }
+
+        private static long countCatalogEntries(Path cat) throws IOException { long n=0; try (BufferedReader br = Files.newBufferedReader(cat)) { while (br.readLine()!=null) n++; } return n; }
+        private static int nextPow2(int x){ int r=1; while (r<x && r>0) r<<=1; return (r>0)? r : x; }
+
+        private static Entry readEntry(Path p) throws IOException {
+            try (DataInputStream din = new DataInputStream(new BufferedInputStream(Files.newInputStream(p)))) {
+                byte[] mg = new byte[5]; din.readFully(mg);
+                if (!Arrays.equals(mg, MAGIC)) throw new IOException("Bad inventory magic in "+p);
+                String repoId = din.readUTF();
+                String repoName = din.readUTF();
+                String driveId = din.readUTF();
+                String label = din.readUTF();
+                long ts = din.readLong();
+                long n = din.readLong();
+                int mBits = din.readInt();
+                int k = din.readInt();
+                int blen = din.readInt();
+                byte[] bits = new byte[blen];
+                din.readFully(bits);
+                return new Entry(repoId, repoName, driveId, label, ts, n, new BloomFilter(mBits, k, bits));
+            }
+        }
+
+        private static BufferedReader openManifestReaderForInventory(Path manifestPath, Crypto.Ctx crypto) throws Exception {
+            String fn = manifestPath.getFileName().toString();
+            InputStream in = Files.newInputStream(manifestPath);
+            if (fn.endsWith(".jsonl.gcm")) {
+                if (crypto==null || crypto.master==null) throw new IOException("Encrypted manifest: provide --repo and --passphrase to decrypt.");
+                in = crypto.decryptingInputStream(in, Crypto.MANIFEST_MAGIC);
+            }
+            return new BufferedReader(new InputStreamReader(in));
+        }
+
+        static final class Entry {
+            final String repoId, repoName, driveId, label; final long timestamp, nEntries; final BloomFilter bf;
+            Entry(String repoId, String repoName, String driveId, String label, long ts, long n, BloomFilter bf){
+                this.repoId=repoId; this.repoName=repoName; this.driveId=driveId; this.label=label; this.timestamp=ts; this.nEntries=n; this.bf=bf;
+            }
+        }
+
+        static final class BloomFilter {
+            final int mBits, k; final byte[] bits;
+            BloomFilter(int mBits, int k){ this.mBits=mBits; this.k=k; this.bits = new byte[(mBits+7)>>3]; }
+            BloomFilter(int mBits, int k, byte[] pre){ this.mBits=mBits; this.k=k; this.bits = pre; }
+            void add(byte[] key){ int[] idx = idxs(key); for (int b : idx){ bits[b>>3] |= (1<<(b&7)); } }
+            boolean contains(byte[] key){ int[] idx = idxs(key); for (int b : idx){ if ((bits[b>>3] & (1<<(b&7)))==0) return false; } return true; }
+            private int[] idxs(byte[] key){
+                long h1 = toLong(key, 0) ^ toLong(key, 16);
+                long h2 = toLong(key, 8) ^ (h1<<1 | h1>>>63);
+                int[] r = new int[k];
+                for (int i=0;i<k;i++){
+                    long x = h1 + (long)i * h2;
+                    int v = (int)((x ^ (x>>>32)) & 0x7fffffff);
+                    r[i] = (mBits>0) ? (v % mBits) : 0;
+                }
+                return r;
+            }
+            private long toLong(byte[] b, int off){ long v=0; for (int i=0;i<8;i++){ v = (v<<8) | (b[(off+i)%b.length] & 0xFFL); } return v; }
+        }
+    }
+
+    // ================= FastCDC =================
+
+    static final class FastCDCStream {
+        private final int min, avg, max, avgMask;
+        private int h=0, n=0;
+        private static final int[] GEAR = new int[256];
+        static { long seed=0x9E3779B97F4A7C15L; for(int i=0;i<256;i++){ seed^=seed<<13; seed^=seed>>>7; seed^=seed<<17; GEAR[i]=(int)seed; } }
+        FastCDCStream(int min, int avg, int max){
+            if (!(min<avg && avg<max)) throw new IllegalArgumentException("min<avg<max required");
+            this.min=min; this.avg=avg; this.max=max; this.avgMask = maskFor(avg);
+        }
+        private int maskFor(int size){ int n=0; while ((1<<n)<size) n++; return ~((1<<n)-1); }
+        void update(int b){ n++; h = (h<<1) + GEAR[b & 0xFF]; }
+        boolean shouldCut(){ if (n<min) return false; if ((h & avgMask)==0) return true; return n>=max; }
+        void resetForNextChunk(){ n=0; h=0; }
+    }
+
+    // ================= Reed–Solomon =================
+
+    static final class ReedSolomon {
+        final int K, R; final GF256 gf = new GF256(0x11D); final byte[][] gen;
+        ReedSolomon(int K, int R){ if (K<=0||R<=0) throw new IllegalArgumentException("K,R>0"); this.K=K; this.R=R; this.gen = buildVandermonde(R,K); }
+        private byte[][] buildVandermonde(int rows,int cols){
+            byte[][] m = new byte[rows][cols];
+            for (int r=0;r<rows;r++){ byte x=(byte)(r+1), p=1; for (int c=0;c<cols;c++){ m[r][c]=p; p=gf.mul(p,x); } }
+            return m;
+        }
+        void encode(byte[][] data, byte[][] parity){
+            int len = data[0].length; for (byte[] p : parity) if (p.length!=len) throw new IllegalArgumentException("len mismatch");
+            for (int r=0;r<R;r++){ byte[] out = parity[r];
+                for (int i=0;i<len;i++){ int acc=0; for (int k=0;k<K;k++){ acc ^= gf.mul((byte)(data[k][i] & 0xFF), gen[r][k]) & 0xFF; } out[i]=(byte)acc; }
+            }
+        }
         byte[] decodeSingle(byte[][] data, List<byte[]> parity, int missingIndex){
-            int len = data[0].length;
-            for (byte[] d: data) if (d.length!=len) return null;
-            // Syndromes
-            byte[][] synd = new byte[R][len];
+            int len = data[0].length; for (byte[] d: data) if (d.length!=len) return null;
+            int R = parity.size(); byte[][] synd = new byte[R][len];
             for (int r=0;r<R;r++){
                 for (int i=0;i<len;i++){
                     int acc = parity.get(r)[i] & 0xFF;
-                    for (int k=0;k<K;k++){
-                        acc ^= gf.mul(data[k][i], gen[r][k]) & 0xFF;
-                    }
+                    for (int k=0;k<K;k++){ acc ^= gf.mul(data[k][i], gen[r][k]) & 0xFF; }
                     synd[r][i]=(byte)acc;
                 }
             }
@@ -723,8 +1214,8 @@ public class ColdStore {
             for (int i=0;i<len;i++){
                 int val=0, cnt=0;
                 for (int r=0;r<R;r++){
-                    byte s = synd[r][i];
-                    byte g = gen[r][missingIndex];
+                    byte s=synd[r][i];
+                    byte g=gen[r][missingIndex];
                     if (g!=0){ byte dm = gf.div(s,g); val ^= dm & 0xFF; cnt++; }
                 }
                 if (cnt==0) return null;
@@ -733,41 +1224,388 @@ public class ColdStore {
             return rec;
         }
     }
-
     static final class GF256 {
         final int[] exp=new int[512], log=new int[256];
-        GF256(int prim){
-            int x=1;
-            for (int i=0;i<255;i++){ exp[i]=x; log[x]=i; x<<=1; if ((x&0x100)!=0) x^=prim; }
-            for (int i=255;i<512;i++) exp[i]=exp[i-255];
-            log[0]=0;
+        GF256(int prim){ int x=1; for (int i=0;i<255;i++){ exp[i]=x; log[x]=i; x<<=1; if ((x&0x100)!=0) x^=prim; } for (int i=255;i<512;i++) exp[i]=exp[i-255]; log[0]=0; }
+        byte mul(byte a, byte b){ int ai=a&0xFF, bi=b&0xFF; if (ai==0||bi==0) return 0; return (byte)exp[log[ai]+log[bi]]; }
+        byte div(byte a, byte b){ int ai=a&0xFF, bi=b&0xFF; if (ai==0) return 0; if (bi==0) throw new ArithmeticException("/0"); return (byte)exp[(log[ai]-log[bi]+255)%255]; }
+    }
+
+    // ================= Location-aware Global Index =================
+
+    static final class GlobalIndex implements Closeable {
+        // Files:
+        // base (path or dir)/chunks.idx.{meta,dat,delta}
+        // meta: Properties; includes repo.id, repo.name, drive ordinals -> ids/labels
+        // dat:  sorted records of [32-byte SHA-256 | 1-byte driveOrdinal]
+        // delta: text lines "hex\tord\n"
+        private final Path base, meta, dat, delta;
+        private String repoId, repoName;
+
+        private final Map<Integer,String> ordToDriveId = new HashMap<>();
+        private final Map<Integer,String> ordToLabel   = new HashMap<>();
+        private final Map<String,Integer> driveIdToOrd = new HashMap<>();
+        private int currentDriveOrd = -1;
+
+        private final Map<String,Integer> deltaMap = new HashMap<>(); // hex -> ord
+        private RandomAccessFile datRaf = null;
+
+        static GlobalIndex open(Path path, String expectedRepoIdOrNull, String expectedNameOrNull,
+                                String currentDriveIdOrNull, String currentDriveLabelOrNull) throws IOException {
+            Path base = path;
+            if (Files.isDirectory(base)) base = base.resolve("chunks.idx");
+            Path meta = Path.of(base.toString()+".meta");
+            Path dat  = Path.of(base.toString()+".dat");
+            Path delta= Path.of(base.toString()+".delta");
+
+            GlobalIndex gi = new GlobalIndex(base, meta, dat, delta);
+            gi.loadOrInitMeta(expectedRepoIdOrNull, expectedNameOrNull);
+            gi.ensureFiles();
+            gi.loadDelta();
+            gi.openDat();
+
+            if (currentDriveIdOrNull != null) {
+                gi.ensureDriveOrdinal(currentDriveIdOrNull, currentDriveLabelOrNull==null? "" : currentDriveLabelOrNull);
+            }
+            return gi;
         }
-        byte mul(byte a, byte b){
-            int ai=a&0xFF, bi=b&0xFF;
-            if (ai==0||bi==0) return 0;
-            return (byte)exp[log[ai]+log[bi]];
+
+        private GlobalIndex(Path base, Path meta, Path dat, Path delta){ this.base=base; this.meta=meta; this.dat=dat; this.delta=delta; }
+
+        private void loadOrInitMeta(String expectedRepoIdOrNull, String expectedNameOrNull) throws IOException {
+            Properties p = new Properties();
+            if (Files.exists(meta)) {
+                try (InputStream in = Files.newInputStream(meta)) { p.load(in); }
+                this.repoId   = p.getProperty("repo.id");
+                this.repoName = p.getProperty("repo.name");
+                int n = Integer.parseInt(p.getProperty("drives.count", "0"));
+                for (int i=0;i<n;i++){
+                    String did = p.getProperty("drive."+i+".id");
+                    String lab = p.getProperty("drive."+i+".label", "");
+                    if (did!=null) { ordToDriveId.put(i,did); driveIdToOrd.put(did,i); ordToLabel.put(i, lab); }
+                }
+                LOG.debug("Opened global index meta: repoId=%s repoName=%s drives=%d", this.repoId, this.repoName, n);
+            } else {
+                if (expectedRepoIdOrNull==null) throw new IOException("--global-index meta missing and no repo id provided");
+                this.repoId   = expectedRepoIdOrNull;
+                this.repoName = expectedNameOrNull==null? "" : expectedNameOrNull;
+                storeMeta(); // empty drives
+                LOG.debug("Initialized global index meta at %s", meta.toAbsolutePath());
+            }
+            if (expectedRepoIdOrNull!=null && !Objects.equals(expectedRepoIdOrNull, this.repoId))
+                throw new IOException("Global index belongs to a different repo (repo.id mismatch).");
         }
-        byte div(byte a, byte b){
-            int ai=a&0xFF, bi=b&0xFF;
-            if (ai==0) return 0;
-            if (bi==0) throw new ArithmeticException("/0");
-            return (byte)exp[(log[ai]-log[bi]+255)%255];
+
+        private void storeMeta() throws IOException {
+            Properties p = new Properties();
+            p.setProperty("repo.id", this.repoId==null? "" : this.repoId);
+            p.setProperty("repo.name", this.repoName==null? "" : this.repoName);
+            int n = ordToDriveId.size();
+            p.setProperty("drives.count", String.valueOf(n));
+            for (Map.Entry<Integer,String> e : ordToDriveId.entrySet()){
+                int ord = e.getKey();
+                p.setProperty("drive."+ord+".id", e.getValue());
+                p.setProperty("drive."+ord+".label", ordToLabel.getOrDefault(ord,""));
+            }
+            Files.createDirectories(meta.getParent()==null? Path.of(".") : meta.getParent());
+            try (OutputStream out = Files.newOutputStream(meta, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                p.store(out, "ColdStore Global Index (location-aware)");
+            }
+        }
+
+        private void ensureFiles() throws IOException {
+            if (!Files.exists(dat))   Files.createFile(dat);
+            if (!Files.exists(delta)) Files.createFile(delta);
+        }
+
+        private void loadDelta() throws IOException {
+            try (BufferedReader br = Files.newBufferedReader(delta)) {
+                String s;
+                while ((s=br.readLine())!=null) {
+                    int t = s.indexOf('\t');
+                    if (t<=0) continue;
+                    String hex = s.substring(0,t).trim();
+                    int ord = Integer.parseInt(s.substring(t+1).trim());
+                    if (hex.length()==64) deltaMap.put(hex, ord);
+                }
+            }
+            LOG.debug("Global index loaded delta entries: %d", deltaMap.size());
+        }
+
+        private void openDat() throws IOException { datRaf = new RandomAccessFile(dat.toFile(), "r"); }
+
+        private void ensureDriveOrdinal(String driveId, String label) throws IOException {
+            Integer ord = driveIdToOrd.get(driveId);
+            if (ord == null) {
+                // assign next ordinal (0..255)
+                ord = ordToDriveId.keySet().stream().mapToInt(i->i).max().orElse(-1) + 1;
+                if (ord > 255) throw new IOException("Exceeded 256 drives in global index.");
+                ordToDriveId.put(ord, driveId);
+                ordToLabel.put(ord, label==null? "" : label);
+                driveIdToOrd.put(driveId, ord);
+                storeMeta();
+                LOG.info("Registered drive in global index: ord=%d id=%s label=%s", ord, driveId, label);
+            } else {
+                // update label if newly provided
+                if (label!=null && !label.isBlank() && !Objects.equals(label, ordToLabel.get(ord))) {
+                    ordToLabel.put(ord, label);
+                    storeMeta();
+                }
+            }
+            currentDriveOrd = ord;
+        }
+
+        int currentDriveOrdinal(){ return currentDriveOrd; }
+
+        boolean contains(byte[] sha) throws IOException {
+            String hx = hex(sha);
+            if (deltaMap.containsKey(hx)) return true;
+            return binSearchLoc(sha) >= 0;
+        }
+
+        int location(byte[] sha) throws IOException {
+            String hx = hex(sha);
+            Integer ord = deltaMap.get(hx);
+            if (ord != null) return ord;
+            return binSearchLoc(sha);
+        }
+
+        void add(byte[] sha, int driveOrd) throws IOException {
+            String h = hex(sha);
+            if (deltaMap.containsKey(h)) return;
+            try (BufferedWriter bw = Files.newBufferedWriter(delta, StandardOpenOption.APPEND)) {
+                bw.write(h); bw.write('\t'); bw.write(Integer.toString(driveOrd)); bw.write('\n');
+            }
+            deltaMap.put(h, driveOrd);
+        }
+
+        void compact() throws IOException {
+            // Gather and sort new entries from deltaMap
+            List<Entry> newOnes = new ArrayList<>(deltaMap.size());
+            for (Map.Entry<String,Integer> e : deltaMap.entrySet()) newOnes.add(new Entry(unhex(e.getKey()), e.getValue().byteValue()));
+            newOnes.sort(Comparator.comparing((Entry x) -> Arrays.toString(x.sha))); // slow comparator? switch to custom
+            newOnes.sort(GlobalIndex::cmpEntry); // custom faster comparator
+
+            Path tmp = Path.of(dat.toString()+".tmp");
+            try (RandomAccessFile in = new RandomAccessFile(dat.toFile(), "r");
+                 FileOutputStream outs = new FileOutputStream(tmp.toFile())) {
+
+                long nRecs = in.length() / 33L;
+                byte[] rec = new byte[33];
+                int i = 0;
+                for (long r=0; r<nRecs; r++) {
+                    in.seek(r*33L);
+                    in.readFully(rec);
+                    // write any new entries smaller than current rec
+                    while (i < newOnes.size() && cmpBytes(newOnes.get(i).sha, rec) < 0) {
+                        outs.write(newOnes.get(i).sha); outs.write(newOnes.get(i).ord);
+                        i++;
+                    }
+                    // if equal, keep existing record (first-write-wins primary location)
+                    if (i < newOnes.size() && cmpBytes(newOnes.get(i).sha, rec) == 0) i++;
+                    // write existing rec
+                    outs.write(rec);
+                }
+                // remaining new entries
+                while (i < newOnes.size()) {
+                    outs.write(newOnes.get(i).sha); outs.write(newOnes.get(i).ord);
+                    i++;
+                }
+            }
+
+            Files.move(tmp, dat, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            Files.writeString(delta, "");
+            deltaMap.clear();
+            if (datRaf != null) datRaf.close(); openDat();
+            LOG.info("Global index compacted.");
+        }
+
+        private int binSearchLoc(byte[] key) throws IOException {
+            long len = datRaf.length(), n = len/33L, lo=0, hi=n-1; byte[] buf=new byte[33];
+            while (lo<=hi){
+                long mid=(lo+hi)>>>1;
+                datRaf.seek(mid*33L);
+                datRaf.readFully(buf);
+                int cmp=cmpBytes(key, buf);
+                if (cmp==0) return buf[32] & 0xFF; // unsigned byte ord
+                if (cmp>0) lo=mid+1; else hi=mid-1;
+            }
+            return -1;
+        }
+
+        private static int cmpBytes(byte[] key, byte[] rec33){
+            for (int i=0;i<32;i++){
+                int ai=key[i]&0xFF, bi=rec33[i]&0xFF;
+                if (ai!=bi) return ai<bi? -1 : 1;
+            }
+            return 0;
+        }
+        private static int cmpEntry(Entry a, Entry b){
+            for (int i=0;i<32;i++){
+                int ai=a.sha[i]&0xFF, bi=b.sha[i]&0xFF;
+                if (ai!=bi) return Integer.compare(ai, bi);
+            }
+            return 0;
+        }
+        static final class Entry { final byte[] sha; final byte ord; Entry(byte[] sha, byte ord){ this.sha=sha; this.ord=ord; } }
+
+        String driveLabel(int ord){ return ordToLabel.getOrDefault(ord, ""); }
+        String driveId(int ord){ return ordToDriveId.getOrDefault(ord, ""); }
+
+        @Override public void close() throws IOException { if (datRaf != null) datRaf.close(); }
+    }
+
+    // ================= Crypto (chunks, parity, manifests) =================
+
+    static final class Crypto {
+        static final byte[] CHUNK_MAGIC    = new byte[]{'C','S','E','1'}; // chunks/parity
+        static final byte[] MANIFEST_MAGIC = new byte[]{'C','S','M','1'}; // manifests
+        static final byte[] KEY_MAGIC      = new byte[]{'C','S','K','1'}; // key.enc
+
+        static final SecureRandom SECURE = new SecureRandom();
+
+        static final class Ctx {
+            final boolean encryptChunksParity;   // repo.props.encrypt
+            final boolean obfuscateParity;       // repo.props.obfuscateParity
+            final boolean encryptManifest;       // repo.props.encryptManifest
+            final byte[] master;                 // 32 bytes (null if no crypto at all)
+
+            Ctx(boolean encryptChunksParity, boolean obfuscateParity, boolean encryptManifest, byte[] master){
+                this.encryptChunksParity=encryptChunksParity; this.obfuscateParity=obfuscateParity; this.encryptManifest=encryptManifest; this.master=master;
+            }
+            boolean anyCrypto(){ return master != null; }
+            boolean enabledForChunks(){ return encryptChunksParity && master!=null; }
+
+            byte[] encryptWithMagic(byte[] plaintext, byte[] magic){
+                try {
+                    byte[] nonce = new byte[12]; SECURE.nextBytes(nonce);
+                    Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+                    c.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(master, "AES"), new GCMParameterSpec(128, nonce));
+                    byte[] ct = c.doFinal(plaintext);
+                    ByteArrayOutputStream out = new ByteArrayOutputStream(magic.length + 12 + ct.length);
+                    out.write(magic); out.write(nonce); out.write(ct);
+                    return out.toByteArray();
+                } catch (Exception e){ throw new RuntimeException(e); }
+            }
+            InputStream decryptingInputStream(InputStream in, byte[] magic){
+                try {
+                    byte[] hdr = in.readNBytes(4);
+                    if (hdr.length!=4 || hdr[0]!=magic[0]||hdr[1]!=magic[1]||hdr[2]!=magic[2]||hdr[3]!=magic[3])
+                        throw new IOException("Unexpected encrypted stream (magic mismatch)");
+                    byte[] nonce = in.readNBytes(12);
+                    Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+                    c.init(Cipher.DECRYPT_MODE, new SecretKeySpec(master, "AES"), new GCMParameterSpec(128, nonce));
+                    return new javax.crypto.CipherInputStream(in, c);
+                } catch (Exception e){ throw new RuntimeException("Failed to open decrypting stream", e); }
+            }
+            String fileIdHash(RepoProps props, String relPath){
+                try {
+                    byte[] data = relPath.getBytes("UTF-8");
+                    if (anyCrypto() && props.obfuscateParity) return hmacHex(data);
+                    return hex(sha256(data)); // legacy
+                } catch (Exception e){ throw new RuntimeException(e); }
+            }
+            String hmacHex(byte[] data){
+                try {
+                    Mac mac = Mac.getInstance("HmacSHA256");
+                    mac.init(new SecretKeySpec(master, "HmacSHA256"));
+                    return hex(mac.doFinal(data));
+                } catch (Exception e){ throw new RuntimeException(e); }
+            }
+        }
+
+        static Ctx ctxForRepo(RepoVolume v, String passphrase) throws IOException {
+            boolean needKey = v.props.encrypt || v.props.obfuscateParity || v.props.encryptManifest;
+            if (!needKey) return new Ctx(false, v.props.obfuscateParity, v.props.encryptManifest, null);
+
+            if (!Files.exists(v.keyFile)) {
+                if (passphrase==null) passphrase = promptPass("Create passphrase for encrypted features (wraps a random 256-bit key): ");
+                createWrappedKey(v.keyFile, passphrase);
+                LOG.info("Created wrapped key at %s", v.keyFile);
+            }
+            if (passphrase==null) passphrase = promptPass("Enter passphrase for encrypted repo features: ");
+            byte[] master = unwrapKey(v.keyFile, passphrase);
+            return new Ctx(v.props.encrypt, v.props.obfuscateParity, v.props.encryptManifest, master);
+        }
+
+        static String promptPass(String msg) throws IOException {
+            Console c = System.console();
+            if (c != null) { char[] pw = c.readPassword(msg); return pw==null? "" : new String(pw); }
+            System.out.print(msg);
+            BufferedReader r = new BufferedReader(new InputStreamReader(System.in));
+            return r.readLine();
+        }
+
+        static void createWrappedKey(Path keyFile, String passphrase) throws IOException {
+            byte[] master = new byte[32]; SECURE.nextBytes(master);
+            byte[] salt   = new byte[16]; SECURE.nextBytes(salt);
+            int iter = 210_000;
+
+            byte[] kek = kdf(passphrase, salt, iter, 32);
+            byte[] nonce = new byte[12]; SECURE.nextBytes(nonce);
+
+            try {
+                Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+                c.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(kek, "AES"), new GCMParameterSpec(128, nonce));
+                byte[] ct = c.doFinal(master);
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                out.write(KEY_MAGIC);                // 4
+                out.write(salt);                     // 16
+                out.write(new byte[]{ (byte)(iter>>>24), (byte)(iter>>>16), (byte)(iter>>>8), (byte)iter }); // 4
+                out.write(nonce);                    // 12
+                out.write(ct);                       // 32 + tag
+                Files.write(keyFile, out.toByteArray(), StandardOpenOption.CREATE_NEW);
+            } catch (Exception e){ throw new IOException("Failed to create wrapped key", e); }
+        }
+
+        static byte[] unwrapKey(Path keyFile, String passphrase) throws IOException {
+            byte[] all = Files.readAllBytes(keyFile);
+            if (all.length < 4+16+4+12+32) throw new IOException("key.enc too short/corrupt");
+            if (all[0]!=KEY_MAGIC[0]||all[1]!=KEY_MAGIC[1]||all[2]!=KEY_MAGIC[2]||all[3]!=KEY_MAGIC[3])
+                throw new IOException("key.enc has unknown format");
+            byte[] salt = Arrays.copyOfRange(all, 4, 20);
+            int iter = ((all[20]&0xFF)<<24)|((all[21]&0xFF)<<16)|((all[22]&0xFF)<<8)|(all[23]&0xFF);
+            byte[] nonce = Arrays.copyOfRange(all, 24, 36);
+            byte[] ct    = Arrays.copyOfRange(all, 36, all.length);
+            byte[] kek = kdf(passphrase, salt, iter, 32);
+            try {
+                Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+                c.init(Cipher.DECRYPT_MODE, new SecretKeySpec(kek, "AES"), new GCMParameterSpec(128, nonce));
+                return c.doFinal(ct);
+            } catch (Exception e){ throw new IOException("Wrong passphrase or key.enc corrupt", e); }
+        }
+
+        static byte[] kdf(String pass, byte[] salt, int iter, int len){
+            try {
+                PBEKeySpec spec = new PBEKeySpec(pass.toCharArray(), salt, iter, len*8);
+                SecretKeyFactory f = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+                return f.generateSecret(spec).getEncoded();
+            } catch (Exception e){ throw new RuntimeException(e); }
+        }
+
+        static void encryptFile(Path plain, Path enc, Ctx ctx, byte[] magic) throws IOException {
+            if (ctx.master == null) throw new IOException("Encryption requested but no master key loaded.");
+            byte[] nonce = new byte[12]; SECURE.nextBytes(nonce);
+            try (InputStream in = Files.newInputStream(plain);
+                 OutputStream rawOut = Files.newOutputStream(enc, StandardOpenOption.CREATE_NEW)) {
+                rawOut.write(magic);
+                rawOut.write(nonce);
+                Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+                c.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(ctx.master, "AES"), new GCMParameterSpec(128, nonce));
+                try (javax.crypto.CipherOutputStream cos = new javax.crypto.CipherOutputStream(rawOut, c)) { in.transferTo(cos); }
+            } catch (Exception e){ throw new IOException("Failed to encrypt file "+plain.getFileName(), e); }
         }
     }
 
-    // ======== small utilities ========
+    // ================= Utils =================
 
-    static byte[] sha256(byte[] buf){
-        try { MessageDigest md=MessageDigest.getInstance("SHA-256"); return md.digest(buf); }
-        catch (Exception e){ throw new RuntimeException(e); }
-    }
+    static byte[] sha256(byte[] buf){ try { MessageDigest md=MessageDigest.getInstance("SHA-256"); return md.digest(buf); } catch (Exception e){ throw new RuntimeException(e); } }
     static String hex(byte[] b){ StringBuilder sb=new StringBuilder(b.length*2); for (byte x:b){ sb.append(Character.forDigit((x>>>4)&0xF,16)).append(Character.forDigit(x&0xF,16)); } return sb.toString(); }
     static byte[] unhex(String s){ int n=s.length(); byte[] out=new byte[n/2]; for (int i=0;i<n;i+=2) out[i/2]=(byte)((Character.digit(s.charAt(i),16)<<4)|Character.digit(s.charAt(i+1),16)); return out; }
     static String jesc(String s){ return s.replace("\\","\\\\").replace("\"","\\\""); }
     static String extractJsonValue(String json, String key){
         String p="\""+key+"\":";
-        int i=json.indexOf(p);
-        if (i<0) return "";
+        int i=json.indexOf(p); if (i<0) return "";
         int j=i+p.length();
         if (json.charAt(j)=='"'){ int k=json.indexOf('"', j+1); return json.substring(j+1,k); }
         int k=j; while (k<json.length() && "0123456789".indexOf(json.charAt(k))>=0) k++;
@@ -778,19 +1616,45 @@ public class ColdStore {
         int i=json.indexOf(p); if (i<0) return "";
         int j=json.indexOf('[', i); int k=json.indexOf(']', j);
         if (j<0||k<0) return "";
-        String inner=json.substring(j+1,k).trim();
-        return inner;
+        return json.substring(j+1,k).trim();
     }
     static String stripQuotes(String s){ s=s.trim(); if (s.startsWith("\"")&&s.endsWith("\"")) return s.substring(1,s.length()-1); return s; }
-    static byte[] readMaybeGunzip(Path p) throws Exception {
-        try (InputStream in = Files.newInputStream(p);
-             BufferedInputStream bin = new BufferedInputStream(in)) {
-            bin.mark(4);
-            int b0=bin.read(), b1=bin.read(); bin.reset();
-            InputStream payload = (b0==0x1f && b1==0x8b) ? new GZIPInputStream(bin) : bin;
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            payload.transferTo(out);
-            return out.toByteArray();
+
+    static byte[] gzip(byte[] in){
+        try { ByteArrayOutputStream bos = new ByteArrayOutputStream(); try (GZIPOutputStream gz = new GZIPOutputStream(bos, true)) { gz.write(in); } return bos.toByteArray(); }
+        catch (IOException e){ throw new RuntimeException(e); }
+    }
+
+    /** Read a stored chunk/parity file (handles CHUNK_MAGIC + optional gzip). */
+    static byte[] readPayload(Path p, Crypto.Ctx crypto, boolean maybeGunzip) throws Exception {
+        byte[] fileBytes = Files.readAllBytes(p);
+
+        if (fileBytes.length>=4 && fileBytes[0]==Crypto.CHUNK_MAGIC[0] && fileBytes[1]==Crypto.CHUNK_MAGIC[1]
+                && fileBytes[2]==Crypto.CHUNK_MAGIC[2] && fileBytes[3]==Crypto.CHUNK_MAGIC[3]) {
+            if (crypto.master == null) throw new IOException("Encrypted data present but no passphrase provided.");
+            byte[] nonce = Arrays.copyOfRange(fileBytes,4,16);
+            byte[] ct    = Arrays.copyOfRange(fileBytes,16,fileBytes.length);
+            byte[] dec;
+            try {
+                Cipher c = Cipher.getInstance("AES/GCM/NoPadding");
+                c.init(Cipher.DECRYPT_MODE, new SecretKeySpec(crypto.master,"AES"), new GCMParameterSpec(128, nonce));
+                dec = c.doFinal(ct);
+            } catch (Exception e){ throw new IOException("Decryption failed (wrong passphrase or file corrupt).", e); }
+            if (!maybeGunzip) return dec;
+            if (dec.length>=2 && (dec[0]&0xFF)==0x1f && (dec[1]&0xFF)==0x8b) {
+                try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(dec))) {
+                    ByteArrayOutputStream out = new ByteArrayOutputStream(); gis.transferTo(out); return out.toByteArray();
+                }
+            }
+            return dec;
         }
+
+        if (!maybeGunzip) return fileBytes;
+        if (fileBytes.length>=2 && (fileBytes[0]&0xFF)==0x1f && (fileBytes[1]&0xFF)==0x8b) {
+            try (GZIPInputStream gis = new GZIPInputStream(new ByteArrayInputStream(fileBytes))) {
+                ByteArrayOutputStream out = new ByteArrayOutputStream(); gis.transferTo(out); return out.toByteArray();
+            }
+        }
+        return fileBytes;
     }
 }
