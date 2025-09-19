@@ -1,0 +1,19 @@
+COLDSTORE(1)  User Commands
+
+NAME
+    ColdStore - Incremental, deduplicated backup with FastCDC and Reed–Solomon parity.
+
+SYNOPSIS
+    java ColdStore <command> [options]
+
+COMMANDS
+    init            Initialize a repo volume.
+    info|list       Show repo and snapshots.
+    backup          Run a backup from --source to --repo.
+    restore         Restore a snapshot or union of latest snapshots.
+    restore-plan    Offline planning using inventories/global index.
+    inventory       Build/list/locate/suggest using Bloom filters.
+    xparity-sweep   Finalize cross-file parity stripes.
+    index-compact   Compact the global index.
+
+See ColdStore-Manual.md for full usage and examples.
