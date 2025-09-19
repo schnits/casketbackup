@@ -17,10 +17,11 @@ import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
- * ColdStore — incremental backup with streaming FastCDC + per-file Reed–Solomon parity,
- * cross-drive dedupe with a portable, location-aware global index, optional AES-256-GCM
- * encryption for chunks & parity, optional MANIFEST encryption, offline drive-by-drive
- * restore and restore planning.
+ * ColdStore — incremental backup with streaming FastCDC + cross-drive dedupe +
+ * Reed–Solomon parity. Now includes cross-file parity packer (covers nearly all
+ * chunks on a drive), optional per-file parity (auto-disabled when cross-file
+ * is enabled), AES-256-GCM encryption (chunks/parity), optional encrypted
+ * manifests, location-aware global index, and offline restore planning.
  *
  * Java 11+ (uses InputStream.transferTo). No external libraries.
  */
@@ -69,7 +70,7 @@ public class ColdStore {
                         encrypt, obfParity, encManifest
                 );
 
-                Crypto.Ctx crypto = Crypto.ctxForRepo(v, passFrom(a)); // may create key.enc if crypto features enabled
+                Crypto.Ctx crypto = Crypto.ctxForRepo(v, passFrom(a));
                 LOG.info("Initialized repo: %s (repo.id=%s drive.id=%s) at %s", v.props.repoName, v.props.repoId, v.props.driveId, repo);
                 v.showInfo();
             }
@@ -89,6 +90,9 @@ public class ColdStore {
                 long targetBytes = a.containsKey("--target-bytes") ? pLong(a.get("--target-bytes")) : Long.MAX_VALUE;
                 double targetFill = a.containsKey("--target-fill") ? pDouble(a.get("--target-fill")) : -1.0;
 
+                boolean xfileParity = Boolean.parseBoolean(a.getOrDefault("--xfile-parity","false"));
+                boolean xfileFinalize = Boolean.parseBoolean(a.getOrDefault("--xfile-finalize-partial","true"));
+
                 RepoVolume v = RepoVolume.openOrInit(repo, null,8,2,262144,1048576,4194304,false,false,false,false);
                 Crypto.Ctx crypto = Crypto.ctxForRepo(v, passFrom(a));
 
@@ -101,11 +105,12 @@ public class ColdStore {
                 String snapName = "SNAP_" + DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH-mm-ss'Z'")
                         .withZone(ZoneOffset.UTC).format(Instant.now());
 
-                LOG.info("Starting backup: snapshot=%s, source=%s, RS(k=%d,r=%d), CDC(min=%s,avg=%s,max=%s), compress=%s, encrypt=%s, encManifest=%s",
+                LOG.info("Starting backup: snapshot=%s, source=%s, RS(k=%d,r=%d), CDC(min=%s,avg=%s,max=%s), compress=%s, encrypt=%s, encManifest=%s, xfileParity=%s, finalizePartial=%s",
                         snapName, source, v.props.rsK, v.props.rsR,
-                        hb(v.props.cMin), hb(v.props.cAvg), hb(v.props.cMax), v.props.compress, v.props.encrypt, v.props.encryptManifest);
+                        hb(v.props.cMin), hb(v.props.cAvg), hb(v.props.cMax), v.props.compress, v.props.encrypt, v.props.encryptManifest,
+                        xfileParity, xfileFinalize);
 
-                Backup.runBackup(v, source, snapName, targetBytes, targetFill, gidx, crypto);
+                Backup.runBackup(v, source, snapName, targetBytes, targetFill, gidx, crypto, xfileParity, xfileFinalize);
             }
             case "restore" -> {
                 Path firstRepo = mustPath(a, "--repo");
@@ -176,6 +181,13 @@ public class ColdStore {
                     default -> { System.out.println("inventory modes: --mode scan|list|locate|suggest"); }
                 }
             }
+            case "xparity-sweep" -> {
+                Path repo = mustPath(a, "--repo");
+                boolean finalizePartial = Boolean.parseBoolean(a.getOrDefault("--xfile-finalize-partial","true"));
+                RepoVolume v = RepoVolume.openOrInit(repo, null,8,2,262144,1048576,4194304,false,false,false,false);
+                Crypto.Ctx crypto = Crypto.ctxForRepo(v, passFrom(a));
+                Backup.crossFileParitySweep(v, crypto, finalizePartial);
+            }
             default -> usage();
         }
     }
@@ -190,7 +202,8 @@ public class ColdStore {
 
     private static void usage() {
         System.out.println("""
-        ColdStore — FastCDC + RS parity + cross-drive dedupe + AES-256-GCM (chunks/parity) + optional MANIFEST encryption
+        ColdStore — FastCDC + cross-drive dedupe + Reed–Solomon parity
+        New: cross-file parity packer (--xfile-parity)
 
         Commands:
           init    --repo <path> [--name <RepoName>]
@@ -206,8 +219,10 @@ public class ColdStore {
 
           backup  --repo <path> --source <path>
                   [--global-index <fileOrDir>]
-                  [--target-bytes N]            # hard byte cap (new chunks only)
-                  [--target-fill 0.70]          # % of free space at start (new chunks only)
+                  [--xfile-parity true|false]              # cross-file parity (default false)
+                  [--xfile-finalize-partial true|false]    # default true
+                  [--target-bytes N]                       # hard byte cap (new chunks only)
+                  [--target-fill 0.70]                     # % free-space cap (new chunks only)
                   [--passphrase "..."] [--log off|info|debug|trace]
 
           restore --repo <path> --dest <path> [--snapshot SNAP_...] [--union-latest true|false]
@@ -227,12 +242,14 @@ public class ColdStore {
                                    [--only-file <relpath>] [--only-prefix <relfolder/>]
                                    [--max-drives N] [--passphrase "..."]
 
+          xparity-sweep --repo <path> [--xfile-finalize-partial true|false]
+                        [--passphrase "..."] [--log info]
+
         Notes:
-          - If any of: --encrypt, --encrypt-manifest, or parity obfuscation are enabled, a master key (key.enc) is created/required.
-          - Encrypted manifests are stored as manifests/SNAP_....jsonl.gcm
-          - Effective write cap = min(target-bytes, target-fill × freeAtStart). Parity/metadata don't count toward the cap.
-          - For multi-drive repos, copy repo.properties and key.enc from the first drive to every additional drive.
-          - The global index now records the primary drive ordinal for each chunk (exact location for planning).
+          - Cross-file parity writes stripes under parity_xfile/stripe-XXXXXXXX/.
+          - A small xfile_index.txt maps chunkId -> (stripeId,position) for fast repair.
+          - When --xfile-parity=true, per-file parity is disabled.
+          - Effective write cap = min(target-bytes, target-fill × freeAtStart). Parity/metadata are not counted in the cap.
         """);
     }
 
@@ -278,6 +295,7 @@ public class ColdStore {
 
     static final class RepoVolume {
         final Path root, propsFile, keyFile, chunksDir, parityDir, manifestsDir, chunkCatalog, snapIndex;
+        final Path xparityDir, xfileIndex, xfileState;
         final RepoProps props;
 
         static RepoVolume openOrInit(Path root, String nameOrNull, int k,int r,int cMin,int cAvg,int cMax,
@@ -309,9 +327,6 @@ public class ColdStore {
                         Boolean.parseBoolean(p.getProperty("parity.obfuscate", "false")),
                         Boolean.parseBoolean(p.getProperty("manifest.encrypt","false"))
                 );
-                if (encrypt && !props.encrypt) LOG.info("Repo exists without chunk/parity encryption; ignoring --encrypt=true.");
-                if (obfParity && !props.obfuscateParity) LOG.info("Repo exists without parity obfuscation; ignoring request.");
-                if (encManifest && !props.encryptManifest) LOG.info("Repo exists without manifest encryption; ignoring request.");
             } else {
                 String nm = (nameOrNull!=null ? nameOrNull : "Repo");
                 String rid = UUID.randomUUID().toString();
@@ -331,7 +346,6 @@ public class ColdStore {
                 p.setProperty("parity.obfuscate", String.valueOf(obfParity));
                 p.setProperty("manifest.encrypt", String.valueOf(encManifest));
                 try (OutputStream out = Files.newOutputStream(propsFile, StandardOpenOption.CREATE_NEW)) { p.store(out, "ColdStore Repo"); }
-                LOG.debug("Created new repo.properties at %s", propsFile);
             }
             RepoVolume v = new RepoVolume(root, propsFile, props);
             v.ensureLayout();
@@ -346,15 +360,19 @@ public class ColdStore {
             this.manifestsDir = root.resolve("manifests");
             this.chunkCatalog = root.resolve("chunk_catalog.txt");
             this.snapIndex = root.resolve("snapshots.txt");
+            this.xparityDir = root.resolve("parity_xfile");
+            this.xfileIndex = root.resolve("xfile_index.txt");
+            this.xfileState = root.resolve("xfile_state.txt");
         }
 
         void ensureLayout() throws IOException {
             Files.createDirectories(chunksDir);
             Files.createDirectories(parityDir);
             Files.createDirectories(manifestsDir);
+            Files.createDirectories(xparityDir);
             if (!Files.exists(chunkCatalog)) Files.createFile(chunkCatalog);
             if (!Files.exists(snapIndex)) Files.createFile(snapIndex);
-            LOG.debug("Ensured layout under %s", root);
+            if (!Files.exists(xfileIndex)) Files.createFile(xfileIndex);
         }
 
         void showInfo() throws IOException {
@@ -390,6 +408,10 @@ public class ColdStore {
             return parityDir.resolve(snapshot).resolve(fileIdHash).resolve(String.format("stripe-%08d", stripeIndex));
         }
 
+        Path xfileStripeDir(long stripeId){
+            return xparityDir.resolve(String.format("stripe-%08d", stripeId));
+        }
+
         Path manifestPlainPath(String snapshot){ return manifestsDir.resolve(snapshot + ".jsonl"); }
         Path manifestEncPath(String snapshot){ return manifestsDir.resolve(snapshot + ".jsonl.gcm"); }
         boolean hasEncManifest(String snapshot){ return Files.exists(manifestEncPath(snapshot)); }
@@ -401,7 +423,8 @@ public class ColdStore {
     static final class Backup {
         static void runBackup(RepoVolume vol, Path source, String snapshotName,
                               long targetBytesArg, double targetFill,
-                              GlobalIndex gidx, Crypto.Ctx crypto) throws Exception {
+                              GlobalIndex gidx, Crypto.Ctx crypto,
+                              boolean xfileParity, boolean xfileFinalize) throws Exception {
 
             long freeAtStart = Files.getFileStore(vol.root).getUsableSpace();
             long fillCap = (targetFill > 0.0 && targetFill <= 1.0) ? (long)Math.floor(freeAtStart * targetFill) : Long.MAX_VALUE;
@@ -419,6 +442,12 @@ public class ColdStore {
             Path manifestPlain = vol.manifestPlainPath(snapshotName);
             if (Files.exists(manifestPlain)) throw new IOException("Manifest already exists: " + manifestPlain);
             Path manifestTmp = manifestPlain.resolveSibling(manifestPlain.getFileName().toString()+".tmp");
+
+            XFileParityPacker xpack = null;
+            if (xfileParity) {
+                xpack = new XFileParityPacker(vol, crypto, vol.props.rsK, vol.props.rsR, xfileFinalize);
+                LOG.info("Cross-file parity enabled (K=%d, R=%d, finalizePartial=%s). Per-file parity will be skipped.", vol.props.rsK, vol.props.rsR, xfileFinalize);
+            }
 
             try (BufferedWriter mw = Files.newBufferedWriter(manifestTmp, StandardOpenOption.CREATE_NEW)) {
                 Counters c = new Counters();
@@ -455,7 +484,7 @@ public class ColdStore {
                             bytesThisChunk++;
                             if (cdc.shouldCut()) {
                                 LOG.debug("  CHUNK cut: index=%d size=%s", chunkIdx, hb(bytesThisChunk));
-                                long wrote = processChunk(vol, chunkBuf, chunkIds, chunkSizes, c, gidx, crypto);
+                                long wrote = processChunk(vol, chunkBuf, chunkIds, chunkSizes, c, gidx, crypto, xpack);
                                 newChunkBytesWritten += wrote;
                                 LOG.trace("  CHUNK done: id=%s wrote=%s (cap=%s)", chunkIds.get(chunkIds.size()-1), hb(wrote), hb(targetBytes));
                                 cdc.resetForNextChunk();
@@ -470,13 +499,15 @@ public class ColdStore {
                         }
                         if (!capReached && chunkBuf.size()>0) {
                             LOG.debug("  CHUNK cut (final): index=%d size=%s", chunkIds.size(), hb(chunkBuf.size()));
-                            long wrote = processChunk(vol, chunkBuf, chunkIds, chunkSizes, c, gidx, crypto);
+                            long wrote = processChunk(vol, chunkBuf, chunkIds, chunkSizes, c, gidx, crypto, xpack);
                             newChunkBytesWritten += wrote;
                             LOG.trace("  CHUNK done: id=%s wrote=%s (cap=%s)", chunkIds.get(chunkIds.size()-1), hb(wrote), hb(targetBytes));
                         }
                     }
 
-                    writeParityForFile(vol, snapshotName, rel, chunkIds, chunkSizes, c, crypto);
+                    if (!xfileParity) { // per-file parity only if cross-file is off
+                        writePerFileParity(vol, snapshotName, rel, chunkIds, chunkSizes, c, crypto);
+                    }
 
                     mw.write("{\"path\":\""+jesc(rel)+"\",\"bytes\":"+fileSize+",\"chunks\":[");
                     for (int i=0;i<chunkIds.size();i++){
@@ -488,6 +519,8 @@ public class ColdStore {
 
                     if (newChunkBytesWritten >= targetBytes) break FILES;
                 }
+
+                if (xpack != null) xpack.close(); // flush pending (per flag)
 
                 try (FileChannel ch = FileChannel.open(vol.snapIndex, StandardOpenOption.APPEND)) {
                     ch.write(ByteBuffer.wrap((snapshotName+"\n").getBytes()));
@@ -510,7 +543,7 @@ public class ColdStore {
 
         /** Returns bytes actually written for NEW chunk (post-compress/encrypt). Returns 0 on dedupe or already-present. */
         private static long processChunk(RepoVolume vol, ByteArrayOutputStream buf, List<String> chunkIds, List<Integer> chunkSizes,
-                                         Counters c, GlobalIndex gidx, Crypto.Ctx crypto) throws Exception {
+                                         Counters c, GlobalIndex gidx, Crypto.Ctx crypto, XFileParityPacker xpack) throws Exception {
             byte[] raw = buf.toByteArray();
             buf.reset();
             byte[] sha = sha256(raw);
@@ -557,12 +590,18 @@ public class ColdStore {
             LOG.debug("    WRITE chunk: id=%s stored=%s at %s", cidHex.substring(0,16), hb(sz), dest);
             if (gidx != null) { gidx.add(sha, gidx.currentDriveOrdinal()); LOG.trace("    IDX add (driveOrd=%d): %s", gidx.currentDriveOrdinal(), cidHex.substring(0,16)); }
 
+            // Cross-file parity feed (only for newly written chunks on this drive)
+            if (xpack != null) {
+                xpack.addChunk(cidHex, dest);
+            }
+
             chunkIds.add(cidHex);
             chunkSizes.add(raw.length);
             return sz;
         }
 
-        private static void writeParityForFile(RepoVolume vol, String snapshot, String relPath,
+        /** Legacy per-file parity — skipped when cross-file parity is enabled. */
+        private static void writePerFileParity(RepoVolume vol, String snapshot, String relPath,
                                                List<String> chunkIds, List<Integer> sizes, Counters c, Crypto.Ctx crypto) throws Exception {
             int K = vol.props.rsK, R = vol.props.rsR;
             if (K<=0 || R<=0) return;
@@ -620,18 +659,224 @@ public class ColdStore {
                 sb.append("{\"k\":").append(K).append(",\"r\":").append(R).append(",\"chunks\":[");
                 for (int i=0;i<K;i++){ if (i>0) sb.append(','); String cid=(base+i<chunkIds.size())?chunkIds.get(base+i):""; sb.append('"').append(cid).append('"'); }
                 sb.append("],\"sizes\":[");
-                for (int i=0;i<K;i++){ if (i>0) sb.append(','); int sizeVal=(base+i<chunkIds.size())?realSizes[i]:0; sb.append(sizeVal); }
+                for (int i=0;i<K;i++){ if (i>0) sb.append(','); int sizeVal=(base+i<chunkIds.size())?sizes.get(base+i):0; sb.append(sizeVal); }
                 sb.append("]}");
                 Path sidecar = sdir.resolve("sidecar.json");
                 try (BufferedWriter bw = Files.newBufferedWriter(sidecar, StandardOpenOption.CREATE_NEW)) { bw.write(sb.toString()); }
                 try (FileChannel ch = FileChannel.open(sidecar, StandardOpenOption.READ)) { ch.force(true); }
 
-                LOG.debug("  PARITY stripe: file=%s stripe=%d shards=%d+%d shardSize=%s dir=%s totalWritten=%s",
+                LOG.debug("  PARITY stripe (per-file): file=%s stripe=%d shards=%d+%d shardSize=%s dir=%s totalWritten=%s",
                         relPath, stripeIdx, K, R, hb(maxLen), sdir, hb(totalParity));
             }
         }
 
+        /** Backfill cross-file parity for all chunks already present on a drive. */
+        static void crossFileParitySweep(RepoVolume vol, Crypto.Ctx crypto, boolean finalizePartial) throws Exception {
+            XFileParityPacker xpack = new XFileParityPacker(vol, crypto, vol.props.rsK, vol.props.rsR, finalizePartial);
+            LOG.info("Starting cross-file parity sweep (K=%d, R=%d, finalizePartial=%s)", vol.props.rsK, vol.props.rsR, finalizePartial);
+            long n=0;
+            try (BufferedReader br = Files.newBufferedReader(vol.chunkCatalog)) {
+                String s;
+                while ((s=br.readLine())!=null) {
+                    int t = s.indexOf('\t');
+                    if (t<0) continue;
+                    String hex = s.substring(0,t);
+                    if (hex.length()!=64) continue;
+                    Path p = vol.chunkPath(unhex(hex));
+                    if (Files.exists(p)) {
+                        xpack.addChunk(hex, p);
+                        if ((++n % 1_000_000)==0) LOG.info("  ... %,d chunks fed", n);
+                    }
+                }
+            }
+            xpack.close();
+            LOG.info("Cross-file parity sweep complete. Chunks processed: %,d", n);
+        }
+
         static final class Counters { long newChunks=0, reusedChunks=0, bytesWritten=0; }
+    }
+
+    // ================= Cross-file Parity Packer =================
+
+    static final class XFileParityPacker implements Closeable {
+        private final RepoVolume vol;
+        private final Crypto.Ctx crypto;
+        private final int K, R;
+        private final ReedSolomon rs;
+        private final boolean finalizePartial;
+        private final List<String> chunkIds = new ArrayList<>();
+        private final List<byte[]> data = new ArrayList<>();
+        private final List<Integer> sizes = new ArrayList<>();
+        private int maxLen = 0;
+        private long nextStripeId = 0;
+
+        XFileParityPacker(RepoVolume vol, Crypto.Ctx crypto, int K, int R, boolean finalizePartial) throws IOException {
+            if (K<=0 || R<=0) throw new IllegalArgumentException("RS(K,R) must be > 0");
+            this.vol = vol; this.crypto = crypto; this.K=K; this.R=R; this.finalizePartial = finalizePartial;
+            this.rs = new ReedSolomon(K, R);
+            this.nextStripeId = loadNextStripeId();
+            loadPendingFromState(); // may prefill partial
+        }
+
+        void addChunk(String cidHex, Path chunkPath) throws Exception {
+            byte[] raw = readPayload(chunkPath, crypto, true);
+            chunkIds.add(cidHex);
+            data.add(raw);
+            sizes.add(raw.length);
+            maxLen = Math.max(maxLen, raw.length);
+
+            if (chunkIds.size() == K) flushStripe();
+        }
+
+        @Override public void close() throws IOException {
+            try {
+                if (!chunkIds.isEmpty()) {
+                    if (finalizePartial) {
+                        LOG.info("Finalizing short stripe with %d/%d chunks", chunkIds.size(), K);
+                        flushStripe();
+                    } else {
+                        LOG.info("Carrying over short stripe with %d/%d chunks", chunkIds.size(), K);
+                        savePendingToState();
+                    }
+                } else {
+                    // clear any prior pending (nothing to carry)
+                    clearPendingInState();
+                }
+            } catch (Exception e){ throw new IOException("Failed flushing cross-file parity", e); }
+        }
+
+        private void flushStripe() throws Exception {
+            // Align to maxLen
+            byte[][] dataAligned = new byte[K][maxLen];
+            for (int i=0;i<K;i++){
+                byte[] src = (i<data.size()? data.get(i) : new byte[0]);
+                System.arraycopy(src, 0, dataAligned[i], 0, Math.min(src.length, maxLen));
+            }
+
+            // Compute parity
+            byte[][] parity = new byte[R][maxLen];
+            rs.encode(dataAligned, parity);
+
+            // Write stripe
+            Path sdir = vol.xfileStripeDir(nextStripeId);
+            Files.createDirectories(sdir);
+
+            long totalParity = 0;
+            for (int pi=0; pi<R; pi++) {
+                Path pf = sdir.resolve("p_"+pi);
+                byte[] outBytes = parity[pi];
+                if (crypto.enabledForChunks()) outBytes = crypto.encryptWithMagic(outBytes, Crypto.CHUNK_MAGIC);
+                try (OutputStream os = Files.newOutputStream(pf, StandardOpenOption.CREATE_NEW)) { os.write(outBytes); }
+                try (FileChannel ch = FileChannel.open(pf, StandardOpenOption.READ)) { ch.force(true); }
+                totalParity += Files.size(pf);
+            }
+
+            // Sidecar
+            StringBuilder sb = new StringBuilder();
+            sb.append("{\"k\":").append(K).append(",\"r\":").append(R).append(",\"shardSize\":").append(maxLen).append(",\"chunks\":[");
+            for (int i=0;i<K;i++){ if (i>0) sb.append(','); String cid=(i<chunkIds.size())?chunkIds.get(i):""; sb.append('"').append(cid).append('"'); }
+            sb.append("],\"sizes\":[");
+            for (int i=0;i<K;i++){ if (i>0) sb.append(','); int sz=(i<sizes.size())?sizes.get(i):0; sb.append(sz); }
+            sb.append("]}");
+            Path sidecar = sdir.resolve("sidecar.json");
+            try (BufferedWriter bw = Files.newBufferedWriter(sidecar, StandardOpenOption.CREATE_NEW)) { bw.write(sb.toString()); }
+            try (FileChannel ch = FileChannel.open(sidecar, StandardOpenOption.READ)) { ch.force(true); }
+
+            // Index entries
+            try (FileChannel ch = FileChannel.open(vol.xfileIndex, StandardOpenOption.APPEND)) {
+                for (int i=0;i<chunkIds.size();i++) {
+                    String line = chunkIds.get(i) + "\t" + nextStripeId + "\t" + i + "\n";
+                    ch.write(ByteBuffer.wrap(line.getBytes()));
+                }
+                ch.force(true);
+            }
+
+            LOG.debug("XF-PARITY stripe: id=%d shards=%d+%d shardSize=%s dir=%s totalWritten=%s",
+                    nextStripeId, K, R, hb(maxLen), sdir, hb(totalParity));
+
+            // bump and clear
+            nextStripeId++;
+            saveNextStripeId();
+            chunkIds.clear(); data.clear(); sizes.clear(); maxLen = 0;
+            clearPendingInState();
+        }
+
+        private long loadNextStripeId() throws IOException {
+            // prefer state file
+            if (Files.exists(vol.xfileState)) {
+                Properties p = new Properties();
+                try (InputStream in = Files.newInputStream(vol.xfileState)) { p.load(in); }
+                String nxt = p.getProperty("nextStripeId");
+                if (nxt != null) return Long.parseLong(nxt);
+            }
+            // else scan existing stripes to pick max+1
+            long max = -1;
+            try (DirectoryStream<Path> ds = Files.newDirectoryStream(vol.xparityDir, "stripe-*")) {
+                for (Path s : ds) {
+                    String fn = s.getFileName().toString();
+                    int dash = fn.indexOf('-');
+                    if (dash>=0) {
+                        try { long id = Long.parseLong(fn.substring(dash+1)); if (id>max) max=id; } catch (NumberFormatException ignore) {}
+                    }
+                }
+            }
+            long next = max+1;
+            saveNextStripeId(next);
+            return next;
+        }
+
+        private void saveNextStripeId() throws IOException { saveNextStripeId(this.nextStripeId); }
+        private void saveNextStripeId(long n) throws IOException {
+            Properties p = new Properties();
+            p.setProperty("nextStripeId", Long.toString(n));
+            // also persist pending list if exists (handled elsewhere)
+            try (OutputStream out = Files.newOutputStream(vol.xfileState, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                p.store(out, "Cross-file parity state");
+            }
+        }
+
+        private void loadPendingFromState() throws IOException {
+            if (!Files.exists(vol.xfileState)) return;
+            Properties p = new Properties();
+            try (InputStream in = Files.newInputStream(vol.xfileState)) { p.load(in); }
+            String pend = p.getProperty("pending");
+            if (pend==null || pend.isBlank()) return;
+            LOG.info("Resuming short stripe with %d pending chunks", pend.split(",").length);
+            for (String h : pend.split(",")) {
+                h = h.trim();
+                if (h.isEmpty()) continue;
+                Path cp = vol.chunkPath(unhex(h));
+                if (Files.exists(cp)) {
+                    try {
+                        byte[] raw = readPayload(cp, crypto, true);
+                        chunkIds.add(h); data.add(raw); sizes.add(raw.length);
+                        maxLen = Math.max(maxLen, raw.length);
+                    } catch (Exception e) {
+                        LOG.info("Skipping pending chunk %s (failed to read: %s)", h.substring(0,16), e.getMessage());
+                    }
+                }
+            }
+        }
+
+        private void savePendingToState() throws IOException {
+            Properties p = new Properties();
+            p.setProperty("nextStripeId", Long.toString(nextStripeId));
+            StringBuilder sb = new StringBuilder();
+            for (int i=0;i<chunkIds.size();i++){ if (i>0) sb.append(','); sb.append(chunkIds.get(i)); }
+            p.setProperty("pending", sb.toString());
+            try (OutputStream out = Files.newOutputStream(vol.xfileState, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                p.store(out, "Cross-file parity state");
+            }
+        }
+        private void clearPendingInState() throws IOException {
+            if (!Files.exists(vol.xfileState)) return;
+            Properties p = new Properties();
+            try (InputStream in = Files.newInputStream(vol.xfileState)) { p.load(in); }
+            p.remove("pending");
+            try (OutputStream out = Files.newOutputStream(vol.xfileState, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                p.store(out, "Cross-file parity state");
+            }
+        }
     }
 
     // ================= Restore =================
@@ -703,8 +948,10 @@ public class ColdStore {
                             String cid = stripQuotes(cids.get(idx));
                             byte[] chunk = findChunkAcross(attached, cid, crypto);
                             if (chunk != null) { LOG.trace("    found chunk: %s", cid.substring(0,16)); os.write(chunk); continue; }
-                            byte[] repaired = recoverFromParity(attached, manifestRepo, snapshot, rel, idx, cids, crypto);
-                            if (repaired != null) { LOG.debug("    repaired from parity: %s", cid.substring(0,16)); os.write(repaired); continue; }
+                            byte[] repaired = recoverFromPerFileParity(attached, manifestRepo, snapshot, rel, idx, cids, crypto);
+                            if (repaired != null) { LOG.debug("    repaired (per-file parity): %s", cid.substring(0,16)); os.write(repaired); continue; }
+                            byte[] repairedX = recoverFromXFileParity(attached, cid, crypto);
+                            if (repairedX != null) { LOG.debug("    repaired (cross-file parity): %s", cid.substring(0,16)); os.write(repairedX); continue; }
                             LOG.info("    missing chunk %s. Prompting for another drive...", cid.substring(0,16));
                             RepoVolume nv = promptAttachMore(manifestRepo.props.repoName);
                             if (nv==null) throw new FileNotFoundException("Unrecoverable: missing chunk "+cid);
@@ -769,7 +1016,7 @@ public class ColdStore {
             return null;
         }
 
-        private static byte[] recoverFromParity(List<RepoVolume> attached, RepoVolume manifestRepo,
+        private static byte[] recoverFromPerFileParity(List<RepoVolume> attached, RepoVolume manifestRepo,
                                                 String snapshot, String relPath, int chunkIndexInFile,
                                                 List<String> cids, Crypto.Ctx crypto) throws Exception {
             int K = manifestRepo.props.rsK, R = manifestRepo.props.rsR;
@@ -836,6 +1083,77 @@ public class ColdStore {
             int trueSize = Integer.parseInt(stripQuotes(szs[missingIdx]));
             if (trueSize < rec.length) { byte[] trimmed = new byte[trueSize]; System.arraycopy(rec,0,trimmed,0,trueSize); return trimmed; }
             return rec;
+        }
+
+        /** Recover a missing chunk using cross-file parity. */
+        private static byte[] recoverFromXFileParity(List<RepoVolume> attached, String cidHex, Crypto.Ctx crypto) throws Exception {
+            // find stripe + position on any attached drive via xfile_index.txt
+            for (RepoVolume v : attached) {
+                if (!Files.exists(v.xfileIndex)) continue;
+                long stripeId = -1; int pos = -1;
+                try (BufferedReader br = Files.newBufferedReader(v.xfileIndex)) {
+                    String s;
+                    while ((s=br.readLine())!=null) {
+                        int t1 = s.indexOf('\t'); if (t1<0) continue;
+                        String h = s.substring(0,t1);
+                        if (!h.equals(cidHex)) continue;
+                        int t2 = s.indexOf('\t', t1+1); if (t2<0) continue;
+                        stripeId = Long.parseLong(s.substring(t1+1, t2));
+                        pos = Integer.parseInt(s.substring(t2+1).trim());
+                        break;
+                    }
+                }
+                if (stripeId<0 || pos<0) continue;
+
+                Path sdir = v.xfileStripeDir(stripeId);
+                Path sidecar = sdir.resolve("sidecar.json");
+                if (!Files.exists(sidecar)) continue;
+                String meta = Files.readString(sidecar);
+                int K = Integer.parseInt(extractJsonValue(meta, "k"));
+                int R = Integer.parseInt(extractJsonValue(meta, "r"));
+                int shardSize = Integer.parseInt(extractJsonValue(meta, "shardSize"));
+                String idArr = extractArray(meta, "chunks");
+                String szArr = extractArray(meta, "sizes");
+                String[] ids = idArr.isBlank()? new String[0] : idArr.split(",");
+                String[] szs = szArr.isBlank()? new String[0] : szArr.split(",");
+
+                // assemble data and parity
+                byte[][] data = new byte[K][];
+                int maxLen = shardSize;
+                int missingIdx = pos;
+                for (int i=0;i<K;i++){
+                    String ch = stripQuotes(ids[i]);
+                    if (i==missingIdx || ch.isEmpty()) { data[i] = new byte[0]; continue; }
+                    Path p = v.chunkPath(unhex(ch));
+                    if (Files.exists(p)) data[i] = readPayload(p, crypto, true);
+                    else data[i] = new byte[0];
+                }
+                byte[][] dataAligned = new byte[K][maxLen];
+                for (int i=0;i<K;i++) System.arraycopy(data[i],0,dataAligned[i],0,Math.min(data[i].length, maxLen));
+
+                List<byte[]> parity = new ArrayList<>();
+                for (int pi=0; pi<R; pi++) {
+                    Path pf = sdir.resolve("p_"+pi);
+                    if (Files.exists(pf)) parity.add(readPayload(pf, crypto, false));
+                }
+                if (parity.size()==0) continue;
+                for (int i=0;i<parity.size();i++){
+                    if (parity.get(i).length!=maxLen){
+                        byte[] exp = new byte[maxLen];
+                        System.arraycopy(parity.get(i),0,exp,0,Math.min(parity.get(i).length,maxLen));
+                        parity.set(i, exp);
+                    }
+                }
+
+                ReedSolomon rs = new ReedSolomon(K, parity.size());
+                byte[] rec = rs.decodeSingle(dataAligned, parity, missingIdx);
+                if (rec==null) continue;
+
+                int trueSize = Integer.parseInt(stripQuotes(szs[missingIdx]));
+                if (trueSize < rec.length) { byte[] trimmed = new byte[trueSize]; System.arraycopy(rec,0,trimmed,0,trueSize); return trimmed; }
+                return rec;
+            }
+            return null;
         }
 
         private static RepoVolume promptAttachMore(String repoName) throws Exception {
@@ -1234,11 +1552,6 @@ public class ColdStore {
     // ================= Location-aware Global Index =================
 
     static final class GlobalIndex implements Closeable {
-        // Files:
-        // base (path or dir)/chunks.idx.{meta,dat,delta}
-        // meta: Properties; includes repo.id, repo.name, drive ordinals -> ids/labels
-        // dat:  sorted records of [32-byte SHA-256 | 1-byte driveOrdinal]
-        // delta: text lines "hex\tord\n"
         private final Path base, meta, dat, delta;
         private String repoId, repoName;
 
@@ -1247,7 +1560,7 @@ public class ColdStore {
         private final Map<String,Integer> driveIdToOrd = new HashMap<>();
         private int currentDriveOrd = -1;
 
-        private final Map<String,Integer> deltaMap = new HashMap<>(); // hex -> ord
+        private final Map<String,Integer> deltaMap = new HashMap<>();
         private RandomAccessFile datRaf = null;
 
         static GlobalIndex open(Path path, String expectedRepoIdOrNull, String expectedNameOrNull,
@@ -1337,7 +1650,6 @@ public class ColdStore {
         private void ensureDriveOrdinal(String driveId, String label) throws IOException {
             Integer ord = driveIdToOrd.get(driveId);
             if (ord == null) {
-                // assign next ordinal (0..255)
                 ord = ordToDriveId.keySet().stream().mapToInt(i->i).max().orElse(-1) + 1;
                 if (ord > 255) throw new IOException("Exceeded 256 drives in global index.");
                 ordToDriveId.put(ord, driveId);
@@ -1346,7 +1658,6 @@ public class ColdStore {
                 storeMeta();
                 LOG.info("Registered drive in global index: ord=%d id=%s label=%s", ord, driveId, label);
             } else {
-                // update label if newly provided
                 if (label!=null && !label.isBlank() && !Objects.equals(label, ordToLabel.get(ord))) {
                     ordToLabel.put(ord, label);
                     storeMeta();
@@ -1380,11 +1691,9 @@ public class ColdStore {
         }
 
         void compact() throws IOException {
-            // Gather and sort new entries from deltaMap
             List<Entry> newOnes = new ArrayList<>(deltaMap.size());
             for (Map.Entry<String,Integer> e : deltaMap.entrySet()) newOnes.add(new Entry(unhex(e.getKey()), e.getValue().byteValue()));
-            newOnes.sort(Comparator.comparing((Entry x) -> Arrays.toString(x.sha))); // slow comparator? switch to custom
-            newOnes.sort(GlobalIndex::cmpEntry); // custom faster comparator
+            newOnes.sort(GlobalIndex::cmpEntry);
 
             Path tmp = Path.of(dat.toString()+".tmp");
             try (RandomAccessFile in = new RandomAccessFile(dat.toFile(), "r");
@@ -1396,17 +1705,13 @@ public class ColdStore {
                 for (long r=0; r<nRecs; r++) {
                     in.seek(r*33L);
                     in.readFully(rec);
-                    // write any new entries smaller than current rec
                     while (i < newOnes.size() && cmpBytes(newOnes.get(i).sha, rec) < 0) {
                         outs.write(newOnes.get(i).sha); outs.write(newOnes.get(i).ord);
                         i++;
                     }
-                    // if equal, keep existing record (first-write-wins primary location)
                     if (i < newOnes.size() && cmpBytes(newOnes.get(i).sha, rec) == 0) i++;
-                    // write existing rec
                     outs.write(rec);
                 }
-                // remaining new entries
                 while (i < newOnes.size()) {
                     outs.write(newOnes.get(i).sha); outs.write(newOnes.get(i).ord);
                     i++;
@@ -1427,7 +1732,7 @@ public class ColdStore {
                 datRaf.seek(mid*33L);
                 datRaf.readFully(buf);
                 int cmp=cmpBytes(key, buf);
-                if (cmp==0) return buf[32] & 0xFF; // unsigned byte ord
+                if (cmp==0) return buf[32] & 0xFF;
                 if (cmp>0) lo=mid+1; else hi=mid-1;
             }
             return -1;
@@ -1458,17 +1763,17 @@ public class ColdStore {
     // ================= Crypto (chunks, parity, manifests) =================
 
     static final class Crypto {
-        static final byte[] CHUNK_MAGIC    = new byte[]{'C','S','E','1'}; // chunks/parity
-        static final byte[] MANIFEST_MAGIC = new byte[]{'C','S','M','1'}; // manifests
-        static final byte[] KEY_MAGIC      = new byte[]{'C','S','K','1'}; // key.enc
+        static final byte[] CHUNK_MAGIC    = new byte[]{'C','S','E','1'};
+        static final byte[] MANIFEST_MAGIC = new byte[]{'C','S','M','1'};
+        static final byte[] KEY_MAGIC      = new byte[]{'C','S','K','1'};
 
         static final SecureRandom SECURE = new SecureRandom();
 
         static final class Ctx {
-            final boolean encryptChunksParity;   // repo.props.encrypt
-            final boolean obfuscateParity;       // repo.props.obfuscateParity
-            final boolean encryptManifest;       // repo.props.encryptManifest
-            final byte[] master;                 // 32 bytes (null if no crypto at all)
+            final boolean encryptChunksParity;
+            final boolean obfuscateParity;
+            final boolean encryptManifest;
+            final byte[] master;
 
             Ctx(boolean encryptChunksParity, boolean obfuscateParity, boolean encryptManifest, byte[] master){
                 this.encryptChunksParity=encryptChunksParity; this.obfuscateParity=obfuscateParity; this.encryptManifest=encryptManifest; this.master=master;
@@ -1502,7 +1807,7 @@ public class ColdStore {
                 try {
                     byte[] data = relPath.getBytes("UTF-8");
                     if (anyCrypto() && props.obfuscateParity) return hmacHex(data);
-                    return hex(sha256(data)); // legacy
+                    return hex(sha256(data));
                 } catch (Exception e){ throw new RuntimeException(e); }
             }
             String hmacHex(byte[] data){
@@ -1549,11 +1854,11 @@ public class ColdStore {
                 c.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(kek, "AES"), new GCMParameterSpec(128, nonce));
                 byte[] ct = c.doFinal(master);
                 ByteArrayOutputStream out = new ByteArrayOutputStream();
-                out.write(KEY_MAGIC);                // 4
-                out.write(salt);                     // 16
-                out.write(new byte[]{ (byte)(iter>>>24), (byte)(iter>>>16), (byte)(iter>>>8), (byte)iter }); // 4
-                out.write(nonce);                    // 12
-                out.write(ct);                       // 32 + tag
+                out.write(KEY_MAGIC);
+                out.write(salt);
+                out.write(new byte[]{ (byte)(iter>>>24), (byte)(iter>>>16), (byte)(iter>>>8), (byte)iter });
+                out.write(nonce);
+                out.write(ct);
                 Files.write(keyFile, out.toByteArray(), StandardOpenOption.CREATE_NEW);
             } catch (Exception e){ throw new IOException("Failed to create wrapped key", e); }
         }
