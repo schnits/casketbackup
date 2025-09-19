@@ -52,6 +52,13 @@ public class ColdStore {
         if (cmd.isEmpty()) { usage(); return; }
 
         switch (cmd) {
+case "verify" -> {
+    Path repo = mustPath(a, "--repo");
+    boolean checkParity = Boolean.parseBoolean(a.getOrDefault("--check-parity","true"));
+    Crypto.Ctx crypto = Crypto.ctxForRepo(RepoVolume.openOrInit(repo, null,8,2,262144,1048576,4194304,false,false,false,false), passFrom(a));
+    verifyRepoSimple(repo, checkParity, crypto);
+}
+
             case "init" -> {
                 Path repo = mustPath(a, "--repo");
                 boolean encrypt = Boolean.parseBoolean(a.getOrDefault("--encrypt","false"));
@@ -1930,7 +1937,125 @@ public class ColdStore {
         catch (IOException e){ throw new RuntimeException(e); }
     }
 
-    /** Read a stored chunk/parity file (handles CHUNK_MAGIC + optional gzip). */
+/** VERIFY (simple): scan chunks and relocate any with hash mismatches; optionally check parity shard readability. */
+/** VERIFY (simple): scan chunks and relocate any with hash mismatches; optionally check parity shard readability. */
+static void verifyRepoSimple(Path repo, boolean checkParity, Crypto.Ctx crypto) throws Exception {
+    RepoVolume v = RepoVolume.openOrInit(repo, null,8,2,262144,1048576,4194304,false,false,false,false);
+    LOG.info("Verify start (simple): repo=%s checkParity=%s", repo, checkParity);
+
+    long ok=0,bad=0,relocated=0,failed=0;
+    // Walk chunk fanout
+    if (Files.exists(v.chunksDir)) {
+        try (DirectoryStream<Path> A = Files.newDirectoryStream(v.chunksDir)) {
+            for (Path a : A) if (Files.isDirectory(a)) {
+                try (DirectoryStream<Path> B = Files.newDirectoryStream(a)) {
+                    for (Path b : B) if (Files.isDirectory(b)) {
+                        try (DirectoryStream<Path> C = Files.newDirectoryStream(b)) {
+                            for (Path f : C) if (Files.isRegularFile(f)) {
+                                String cid = f.getFileName().toString();
+                                if (cid.length()!=64) continue;
+                                LOG.trace("Verifying chunk %s at %s", cid, f);
+                                try {
+                                    byte[] raw = readPayload(f, crypto, true); // decode (decrypt/decompress)
+                                    String rec = hex(sha256(raw));
+                                    if (rec.equals(cid)) {
+                                        ok++;
+                                        LOG.trace("  OK: %s", cid.substring(0,16));
+                                    } else {
+                                        bad++;
+                                        LOG.trace("  MISMATCH: %s vs recomputed %s",
+                                                  cid.substring(0,16), rec.substring(0,16));
+                                        // Self-heal: relocate to correct hash
+                                        Path correct = v.chunkPath(unhex(rec));
+                                        Files.createDirectories(correct.getParent());
+                                        byte[] payload = v.props.compress ? gzip(raw) : raw;
+                                        if (crypto.enabledForChunks()) payload = crypto.encryptWithMagic(payload, Crypto.CHUNK_MAGIC);
+                                        Path tmp = correct.resolveSibling(correct.getFileName().toString()+".verify.tmp");
+                                        try (OutputStream out = Files.newOutputStream(tmp, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                                            out.write(payload);
+                                        }
+                                        Files.move(tmp, correct, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                                        try { Files.deleteIfExists(f); } catch (Exception ignore) {}
+                                        try (FileChannel ch = FileChannel.open(v.chunkCatalog, StandardOpenOption.APPEND, StandardOpenOption.CREATE)) {
+                                            ch.write(ByteBuffer.wrap((correct.getFileName().toString()+"\t"+payload.length+"\n").getBytes()));
+                                            ch.force(true);
+                                        }
+                                        LOG.info("Relocated chunk %s -> %s", cid.substring(0,16), rec.substring(0,16));
+                                        LOG.trace("  wrote %d bytes to %s", payload.length, correct);
+                                        relocated++;
+                                    }
+                                } catch (Exception e){
+                                    bad++;
+                                    failed++;
+                                    LOG.info("Chunk read error %s: %s", cid.substring(0,16), e.toString());
+                                    LOG.trace("  exception while verifying chunk %s: %s", cid, e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    long pOK=0,pBAD=0;
+    if (checkParity) {
+        // Per-file parity readability
+        if (Files.exists(v.parityDir)) {
+            try (DirectoryStream<Path> S = Files.newDirectoryStream(v.parityDir)) {
+                for (Path snap : S) if (Files.isDirectory(snap)) {
+                    try (DirectoryStream<Path> F = Files.newDirectoryStream(snap)) {
+                        for (Path filehash : F) if (Files.isDirectory(filehash)) {
+                            try (DirectoryStream<Path> T = Files.newDirectoryStream(filehash)) {
+                                for (Path stripe : T) if (Files.isDirectory(stripe)) {
+                                    for (int r=0;;r++){
+                                        Path pf = stripe.resolve("p_"+r);
+                                        if (!Files.exists(pf)) break;
+                                        LOG.trace("Checking per-file parity shard: %s", pf);
+                                        try {
+                                            readPayload(pf, crypto, false);
+                                            pOK++;
+                                        } catch(Exception e){
+                                            pBAD++;
+                                            LOG.info("Per-file parity shard unreadable: %s", pf);
+                                            LOG.trace("  exception while checking parity shard %s: %s", pf, e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Cross-file parity readability
+        if (Files.exists(v.xparityDir)) {
+            try (DirectoryStream<Path> X = Files.newDirectoryStream(v.xparityDir)) {
+                for (Path stripe : X) if (Files.isDirectory(stripe)) {
+                    for (int r=0;;r++){
+                        Path pf = stripe.resolve("p_"+r);
+                        if (!Files.exists(pf)) break;
+                        LOG.trace("Checking xfile parity shard: %s", pf);
+                        try {
+                            readPayload(pf, crypto, false);
+                            pOK++;
+                        } catch(Exception e){
+                            pBAD++;
+                            LOG.info("XFile parity shard unreadable: %s", pf);
+                            LOG.trace("  exception while checking parity shard %s: %s", pf, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    LOG.info("Verify(simple) result: chunks ok=%d bad=%d relocated=%d failed=%d | parity shards ok=%d bad=%d",
+            ok,bad,relocated,failed,pOK,pBAD);
+}
+
+
+
     static byte[] readPayload(Path p, Crypto.Ctx crypto, boolean maybeGunzip) throws Exception {
         byte[] fileBytes = Files.readAllBytes(p);
 
